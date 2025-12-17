@@ -13,13 +13,13 @@ const spaceGrotesk = Space_Grotesk({
 });
 
 export const metadata: Metadata = {
-  title: "CineMatch AI | Movie Recommendations",
-  description: "Discover your next favorite movie with AI-powered recommendations. Describe the kind of movie you're in the mood for, and we'll find the perfect match.",
-  keywords: ["movies", "recommendations", "AI", "films", "cinema", "entertainment"],
-  authors: [{ name: "CineMatch" }],
+  title: "Mobay | Movie Recommendations",
+  description: "Discover your next favorite movie with Mobay. Describe the kind of movie you're in the mood for, and we'll find the perfect match.",
+  keywords: ["movies", "recommendations", "films", "cinema", "entertainment", "mobay"],
+  authors: [{ name: "Mobay" }],
   openGraph: {
-    title: "CineMatch AI | Movie Recommendations",
-    description: "Discover your next favorite movie with AI-powered recommendations",
+    title: "Mobay | Movie Recommendations",
+    description: "Discover your next favorite movie with Mobay",
     type: "website",
   },
 };
