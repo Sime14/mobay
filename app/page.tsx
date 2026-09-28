@@ -1,7 +1,6 @@
 'use client';
 
 import { useState, useEffect, useRef, type FormEvent } from 'react';
-import Image from 'next/image';
 import type { Title, TitleType } from '@/lib/types';
 
 interface SearchResponse {
@@ -29,6 +28,8 @@ interface SearchState {
 }
 
 const PAGE_SIZE = 24;
+// Titles in the first row of the widest grid; their posters load without waiting to scroll into view
+const FIRST_ROW = 6;
 // The API returns at most 100 results per request
 const MAX_RESULTS = 96;
 
@@ -440,8 +441,8 @@ export default function Home() {
         ) : (
           <>
             <div key={resultsKey} className="title-grid fade-in">
-              {titles.map(title => (
-                <TitleCard key={title.id} title={title} showType={!shown.type} />
+              {titles.map((title, i) => (
+                <TitleCard key={title.id} title={title} showType={!shown.type} priority={i < FIRST_ROW} />
               ))}
             </div>
             {titles.length < total && shown.limit < MAX_RESULTS && (
@@ -476,19 +477,35 @@ export default function Home() {
 
 const TYPE_LABELS: Record<TitleType, string> = { movie: 'Movie', series: 'Series', anime: 'Anime' };
 
-function Poster({ title }: { title: Title }) {
+// TMDB serves every poster at several widths. The data stores w342, so offer w185 too
+// (a third of the bytes) and let the browser pick by card width and screen density.
+function posterSrcSet(url: string): string | undefined {
+  const match = url.match(/^(https:\/\/image\.tmdb\.org\/t\/p\/)w342(\/.+)$/);
+  return match ? `${match[1]}w185${match[2]} 185w, ${url} 342w` : undefined;
+}
+
+// Card width at each grid breakpoint (see .title-grid), so the browser can choose a size
+const POSTER_SIZES = '(min-width: 1280px) 185px, (min-width: 1024px) 18vw, (min-width: 768px) 22vw, (min-width: 640px) 29vw, 47vw';
+
+// `priority` is for posters that are on screen at first, which shouldn't wait to be lazy-loaded
+function Poster({ title, priority }: { title: Title; priority: boolean }) {
   const [failed, setFailed] = useState(false);
 
   if (title.poster && !failed) {
+    const srcSet = posterSrcSet(title.poster);
     return (
-      // Posters come straight from TMDB/AniList's image CDNs, so skip Next's optimizer
-      <Image
+      // A plain img: the posters come straight from TMDB/AniList's image CDNs, and next/image
+      // can't pick between the CDN's own sizes
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
         src={title.poster}
+        srcSet={srcSet}
+        sizes={srcSet ? POSTER_SIZES : undefined}
         alt=""
-        fill
-        sizes="(min-width: 1280px) 200px, (min-width: 768px) 25vw, 50vw"
-        className="object-cover"
-        unoptimized
+        loading={priority ? 'eager' : 'lazy'}
+        fetchPriority={priority ? 'high' : 'auto'}
+        decoding="async"
+        className="absolute inset-0 h-full w-full object-cover"
         onError={() => setFailed(true)}
       />
     );
@@ -501,7 +518,7 @@ function Poster({ title }: { title: Title }) {
   );
 }
 
-function TitleCard({ title, showType }: { title: Title; showType: boolean }) {
+function TitleCard({ title, showType, priority }: { title: Title; showType: boolean; priority: boolean }) {
   // Length for movies; seasons, episodes or format for series and anime
   let detail = '';
   if (title.type === 'movie') detail = title.duration;
@@ -517,7 +534,7 @@ function TitleCard({ title, showType }: { title: Title; showType: boolean }) {
   return (
     <a href={title.link || undefined} target="_blank" rel="noopener noreferrer" className="title-card">
       <div className="title-poster">
-        <Poster title={title} />
+        <Poster title={title} priority={priority} />
         {(title.description || title.genres.length > 0) && (
           <div className="title-overlay" aria-hidden="true">
             {title.genres.length > 0 && <p className="overlay-genres">{title.genres.slice(0, 3).join(' · ')}</p>}

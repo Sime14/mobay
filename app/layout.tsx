@@ -32,6 +32,9 @@ export default function RootLayout({
     // The theme script changes the class before React hydrates
     <html lang="en" className="dark" suppressHydrationWarning>
       <head>
+        {/* Open the connections to the poster servers while the page's own data loads */}
+        <link rel="preconnect" href="https://image.tmdb.org" />
+        <link rel="preconnect" href="https://s4.anilist.co" />
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
       </head>
       <body className={`${inter.variable} antialiased`}>
