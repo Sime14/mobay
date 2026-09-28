@@ -142,6 +142,12 @@ function parseGenres(genresStr: string): string[] {
     }
 }
 
+// Count non-overlapping occurrences of a literal substring (no regex, so user input is safe)
+function countOccurrences(haystack: string, needle: string): number {
+    return haystack.split(needle).length - 1;
+}
+
+// Returns 0 when no search term matches, so non-matching movies can be dropped
 function calculateRelevanceScore(movie: Movie, searchTerms: string[]): number {
     let score = 0;
     const title = movie.title.toLowerCase();
@@ -162,8 +168,7 @@ function calculateRelevanceScore(movie: Movie, searchTerms: string[]): number {
         // Description match (high weight)
         if (description.includes(lowerTerm)) {
             score += 15;
-            const occurrences = (description.match(new RegExp(lowerTerm, 'gi')) || []).length;
-            score += Math.min(occurrences * 2, 10);
+            score += Math.min(countOccurrences(description, lowerTerm) * 2, 10);
         }
 
         // Genre match
@@ -181,6 +186,9 @@ function calculateRelevanceScore(movie: Movie, searchTerms: string[]): number {
             score += 8;
         }
     }
+
+    // Only boost movies that actually matched the query
+    if (score === 0) return 0;
 
     // Boost by rating
     const rating = parseFloat(movie.rating);
@@ -244,10 +252,10 @@ export async function GET(request: NextRequest) {
 
         // Filter movies
         let filteredMovies = movies.filter(movie => {
-            // Genre filter
+            // Genre filter (exact match, so "Drama" doesn't also match "Docudrama")
             if (genre) {
-                const movieGenres = movie.genres.toLowerCase();
-                if (!movieGenres.includes(genre.toLowerCase())) {
+                const wanted = genre.toLowerCase();
+                if (!parseGenres(movie.genres).some(g => g.toLowerCase() === wanted)) {
                     return false;
                 }
             }
@@ -295,7 +303,10 @@ export async function GET(request: NextRequest) {
 
         // If there's a query, score by relevance
         if (query) {
-            const searchTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+            const allTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+            const longTerms = allTerms.filter(t => t.length > 2);
+            // Fall back to short words when the query has nothing longer (e.g. "up")
+            const searchTerms = longTerms.length > 0 ? longTerms : allTerms;
 
             const scoredMovies = filteredMovies.map(movie => ({
                 movie,

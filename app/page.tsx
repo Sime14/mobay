@@ -44,12 +44,17 @@ function parseArrayString(str: string): string[] {
   }
 }
 
-// Format large numbers
+// Format large numbers (e.g. 3000000 -> "3.0M")
 function formatNumber(num: number): string {
-  if (num >= 1000000000) return `$${(num / 1000000000).toFixed(1)}B`;
-  if (num >= 1000000) return `$${(num / 1000000).toFixed(1)}M`;
+  if (num >= 1000000000) return `${(num / 1000000000).toFixed(1)}B`;
+  if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
   if (num >= 1000) return `${(num / 1000).toFixed(1)}K`;
   return num.toString();
+}
+
+// Format money amounts (e.g. 1447038421 -> "$1.4B")
+function formatCurrency(num: number): string {
+  return `$${formatNumber(num)}`;
 }
 
 export default function Home() {
@@ -198,7 +203,7 @@ export default function Home() {
         setSortBy('rating');
         break;
       case 'genre':
-        url += `&genre=${value}&sortBy=rating`;
+        url += `&genre=${encodeURIComponent(value || '')}&sortBy=rating`;
         setGenre(value || '');
         setSortBy('rating');
         break;
@@ -378,7 +383,7 @@ export default function Home() {
                                focus:outline-none focus:border-primary cursor-pointer"
                     >
                       <option value="">All Genres</option>
-                      {availableGenres.slice(0, 30).map(g => (
+                      {availableGenres.map(g => (
                         <option key={g} value={g}>{g}</option>
                       ))}
                     </select>
@@ -586,10 +591,10 @@ export default function Home() {
               <div>
                 <h4 className="font-semibold text-main mb-4">Popular Genres</h4>
                 <ul className="space-y-2 text-sm">
-                  <li><button onClick={() => { setGenre('Action'); handleSearch(); }} className="text-muted hover:text-primary transition-colors">Action</button></li>
-                  <li><button onClick={() => { setGenre('Comedy'); handleSearch(); }} className="text-muted hover:text-primary transition-colors">Comedy</button></li>
-                  <li><button onClick={() => { setGenre('Drama'); handleSearch(); }} className="text-muted hover:text-primary transition-colors">Drama</button></li>
-                  <li><button onClick={() => { setGenre('Horror'); handleSearch(); }} className="text-muted hover:text-primary transition-colors">Horror</button></li>
+                  <li><button onClick={() => handleQuickFilter('genre', 'Action')} className="text-muted hover:text-primary transition-colors">Action</button></li>
+                  <li><button onClick={() => handleQuickFilter('genre', 'Comedy')} className="text-muted hover:text-primary transition-colors">Comedy</button></li>
+                  <li><button onClick={() => handleQuickFilter('genre', 'Drama')} className="text-muted hover:text-primary transition-colors">Drama</button></li>
+                  <li><button onClick={() => handleQuickFilter('genre', 'Horror')} className="text-muted hover:text-primary transition-colors">Horror</button></li>
                 </ul>
               </div>
             </div>
@@ -689,7 +694,7 @@ function MovieCard({ movie }: { movie: Movie }) {
       {/* Box Office */}
       {movie.grossNum > 0 && (
         <div className="mt-3 pt-3 border-t border-border text-xs text-green-600 dark:text-green-400 font-medium">
-          💰 {formatNumber(movie.grossNum)} worldwide
+          💰 {formatCurrency(movie.grossNum)} worldwide
         </div>
       )}
 
