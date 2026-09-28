@@ -142,53 +142,97 @@ function parseGenres(genresStr: string): string[] {
     }
 }
 
-// Count non-overlapping occurrences of a literal substring (no regex, so user input is safe)
-function countOccurrences(haystack: string, needle: string): number {
-    return haystack.split(needle).length - 1;
+// Common words that say nothing about which movie is wanted
+const STOP_WORDS = new Set([
+    'the', 'and', 'for', 'with', 'from', 'about', 'into', 'movie', 'movies', 'film', 'films',
+    'a', 'an', 'of', 'in', 'on', 'to', 'at', 'by', 'is', 'it',
+]);
+
+function escapeRegExp(text: string): string {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Matches the words as whole words (so "up" doesn't match "Superman"), case-insensitive
+function wordPattern(words: string[]): RegExp {
+    const body = words.map(escapeRegExp).join('\\s+');
+    return new RegExp(`(?<![\\p{L}\\p{N}])${body}(?![\\p{L}\\p{N}])`, 'giu');
+}
+
+function countMatches(text: string, pattern: RegExp): number {
+    return text.match(pattern)?.length ?? 0;
+}
+
+interface SearchQuery {
+    terms: { text: string; pattern: RegExp }[];
+    // The whole query as a phrase, when it has more than one word (e.g. "christopher nolan")
+    phrase: RegExp | null;
+    // The whole query, lowercased and with single spaces
+    text: string;
+}
+
+function buildSearchQuery(query: string): SearchQuery {
+    const allWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 0);
+    const keywords = allWords.filter(w => !STOP_WORDS.has(w));
+    // Fall back to every word when the query is only stop words (e.g. "the")
+    const words = keywords.length > 0 ? keywords : allWords;
+
+    return {
+        terms: words.map(text => ({ text, pattern: wordPattern([text]) })),
+        phrase: allWords.length > 1 ? wordPattern(allWords) : null,
+        text: allWords.join(' '),
+    };
 }
 
 // Returns 0 when no search term matches, so non-matching movies can be dropped
-function calculateRelevanceScore(movie: Movie, searchTerms: string[]): number {
+function calculateRelevanceScore(movie: Movie, search: SearchQuery): number {
     let score = 0;
-    const title = movie.title.toLowerCase();
-    const description = movie.description.toLowerCase();
-    const genres = movie.genres.toLowerCase();
-    const stars = movie.stars.toLowerCase();
-    const directors = movie.directors.toLowerCase();
+    let matchedTerms = 0;
 
-    for (const term of searchTerms) {
-        const lowerTerm = term.toLowerCase();
+    for (const { text, pattern } of search.terms) {
+        // Each word counts for the best field it matches, plus a little for every
+        // other field, so a word repeated in the description can't outweigh a
+        // match on the director or cast
+        const fieldScores: number[] = [];
 
-        // Title match (highest weight)
-        if (title.includes(lowerTerm)) {
-            score += 30;
-            if (title.startsWith(lowerTerm)) score += 10;
+        if (countMatches(movie.title, pattern) > 0) {
+            fieldScores.push(movie.title.toLowerCase().startsWith(text) ? 40 : 30);
         }
 
-        // Description match (high weight)
-        if (description.includes(lowerTerm)) {
-            score += 15;
-            score += Math.min(countOccurrences(description, lowerTerm) * 2, 10);
+        // Directors and cast weigh the same, so popularity decides between e.g.
+        // Christopher Nolan's films and those starring Lloyd Nolan
+        if (countMatches(movie.directors, pattern) > 0 || countMatches(movie.stars, pattern) > 0) {
+            fieldScores.push(30);
         }
 
-        // Genre match
-        if (genres.includes(lowerTerm)) {
-            score += 20;
+        if (countMatches(movie.genres, pattern) > 0) fieldScores.push(20);
+
+        const descriptionMatches = countMatches(movie.description, pattern);
+        if (descriptionMatches > 0) {
+            fieldScores.push(10 + Math.min(descriptionMatches * 2, 6));
         }
 
-        // Stars match
-        if (stars.includes(lowerTerm)) {
-            score += 10;
-        }
-
-        // Directors match
-        if (directors.includes(lowerTerm)) {
-            score += 8;
+        if (fieldScores.length > 0) {
+            matchedTerms++;
+            score += Math.max(...fieldScores) + (fieldScores.length - 1) * 5;
         }
     }
 
     // Only boost movies that actually matched the query
     if (score === 0) return 0;
+
+    // The full query as a phrase ("tom hanks", "the godfather") beats scattered words
+    if (search.phrase) {
+        if (countMatches(movie.title, search.phrase) > 0) score += 50;
+        if (countMatches(movie.directors, search.phrase) > 0 || countMatches(movie.stars, search.phrase) > 0) {
+            score += 50;
+        }
+    }
+
+    // Exact title ("Up", "Heat") beats titles that merely contain the words
+    if (movie.title.toLowerCase() === search.text) score += 40;
+
+    // Movies matching only some of the words rank below ones matching all of them
+    score *= matchedTerms / search.terms.length;
 
     // Boost by rating
     const rating = parseFloat(movie.rating);
@@ -196,9 +240,9 @@ function calculateRelevanceScore(movie: Movie, searchTerms: string[]): number {
         score += rating * 2;
     }
 
-    // Boost by vote count (popularity)
+    // Boost by popularity on a log scale (1K votes -> 9, 1M votes -> 18)
     const voteNum = parseVotes(movie.votes);
-    score += Math.min(voteNum / 10000, 5);
+    score += Math.log10(voteNum + 1) * 3;
 
     return score;
 }
@@ -303,14 +347,11 @@ export async function GET(request: NextRequest) {
 
         // If there's a query, score by relevance
         if (query) {
-            const allTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
-            const longTerms = allTerms.filter(t => t.length > 2);
-            // Fall back to short words when the query has nothing longer (e.g. "up")
-            const searchTerms = longTerms.length > 0 ? longTerms : allTerms;
+            const search = buildSearchQuery(query);
 
             const scoredMovies = filteredMovies.map(movie => ({
                 movie,
-                score: calculateRelevanceScore(movie, searchTerms),
+                score: calculateRelevanceScore(movie, search),
             }));
 
             // Filter out zero scores
