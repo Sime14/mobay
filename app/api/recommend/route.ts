@@ -1,234 +1,143 @@
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
-import path from 'path';
-import Papa from 'papaparse';
+import { loadCatalog, type IndexedTitle } from '@/lib/catalog';
+import type { Title, TitleType } from '@/lib/types';
 
-interface Movie {
-    title: string;
-    year: string;
-    duration: string;
-    mpa: string;
-    rating: string;
-    votes: string;
-    metaScore: string;
-    description: string;
-    movieLink: string;
-    directors: string;
-    stars: string;
-    genres: string;
-    languages: string;
-    releaseDate: string;
-    budget: string;
-    grossWorldwide: string;
+const TITLE_TYPES: TitleType[] = ['movie', 'series', 'anime'];
+const MAX_LIMIT = 100;
+
+// Common words that say nothing about which movie is wanted
+const STOP_WORDS = new Set([
+    'the', 'and', 'for', 'with', 'from', 'about', 'into', 'movie', 'movies', 'film', 'films',
+    'a', 'an', 'of', 'in', 'on', 'to', 'at', 'by', 'is', 'it',
+]);
+
+function escapeRegExp(text: string): string {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-interface RawMovieData {
-    Title?: string;
-    Year?: string;
-    Duration?: string;
-    MPA?: string;
-    Rating?: string;
-    Votes?: string;
-    méta_score?: string;
-    description?: string;
-    'Movie Link'?: string;
-    directors?: string;
-    stars?: string;
-    genres?: string;
-    Languages?: string;
-    release_date?: string;
-    budget?: string;
-    grossWorldWWide?: string;
+// Matches the words as whole words (so "up" doesn't match "Superman"), case-insensitive
+function wordPattern(words: string[]): RegExp {
+    const body = words.map(escapeRegExp).join('\\s+');
+    return new RegExp(`(?<![\\p{L}\\p{N}])${body}(?![\\p{L}\\p{N}])`, 'giu');
 }
 
-// Cache for loaded movies
-let moviesCache: Movie[] | null = null;
-let cacheTimestamp: number = 0;
-const CACHE_DURATION = 1000 * 60 * 60; // 1 hour
-
-// Parse votes string to number (e.g., "212K" -> 212000, "1.5M" -> 1500000)
-function parseVotes(votesStr: string): number {
-    if (!votesStr) return 0;
-    const cleaned = votesStr.replace(/,/g, '').trim();
-    const match = cleaned.match(/^([\d.]+)([KM])?$/i);
-    if (!match) return parseFloat(cleaned) || 0;
-
-    let num = parseFloat(match[1]);
-    const suffix = match[2]?.toUpperCase();
-    if (suffix === 'K') num *= 1000;
-    if (suffix === 'M') num *= 1000000;
-    return num;
+function countMatches(text: string, pattern: RegExp): number {
+    return text.match(pattern)?.length ?? 0;
 }
 
-// Parse gross/budget string to number
-function parseGross(grossStr: string): number {
-    if (!grossStr) return 0;
-    const match = grossStr.match(/\$?([\d,]+)/);
-    if (!match) return 0;
-    return parseFloat(match[1].replace(/,/g, '')) || 0;
+interface SearchQuery {
+    terms: { text: string; pattern: RegExp }[];
+    // The whole query as a phrase, when it has more than one word (e.g. "christopher nolan")
+    phrase: RegExp | null;
+    // The whole query, lowercased and with single spaces
+    text: string;
 }
 
-async function loadMovies(): Promise<Movie[]> {
-    // Check cache
-    if (moviesCache && Date.now() - cacheTimestamp < CACHE_DURATION) {
-        return moviesCache;
-    }
+function buildSearchQuery(query: string): SearchQuery {
+    const allWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 0);
+    const keywords = allWords.filter(w => !STOP_WORDS.has(w));
+    // Fall back to every word when the query is only stop words (e.g. "the")
+    const words = keywords.length > 0 ? keywords : allWords;
 
-    const movies: Movie[] = [];
-    const dataDir = path.join(process.cwd(), 'Data');
-
-    try {
-        const years = fs.readdirSync(dataDir);
-
-        // Load all years
-        const validYears = years
-            .filter(year => !isNaN(parseInt(year)))
-            .sort((a, b) => parseInt(b) - parseInt(a));
-
-        for (const year of validYears) {
-            const mergedFilePath = path.join(dataDir, year, `merged_movies_data_${year}.csv`);
-
-            if (fs.existsSync(mergedFilePath)) {
-                const fileContent = fs.readFileSync(mergedFilePath, 'utf-8');
-                const parsed = Papa.parse<RawMovieData>(fileContent, {
-                    header: true,
-                    skipEmptyLines: true,
-                });
-
-                for (const row of parsed.data) {
-                    if (row.Title && row.description) {
-                        // Clean up the title (remove ranking number prefix)
-                        const cleanTitle = row.Title.replace(/^\d+\.\s*/, '');
-
-                        movies.push({
-                            title: cleanTitle,
-                            year: row.Year || year,
-                            duration: row.Duration || '',
-                            mpa: row.MPA || '',
-                            rating: row.Rating || '',
-                            votes: row.Votes || '',
-                            metaScore: row['méta_score'] || '',
-                            description: row.description || '',
-                            movieLink: row['Movie Link'] || '',
-                            directors: row.directors || '',
-                            stars: row.stars || '',
-                            genres: row.genres || '',
-                            languages: row.Languages || '',
-                            releaseDate: row.release_date || '',
-                            budget: row.budget || '',
-                            grossWorldwide: row.grossWorldWWide || '',
-                        });
-                    }
-                }
-            }
-        }
-
-        moviesCache = movies;
-        cacheTimestamp = Date.now();
-
-        return movies;
-    } catch (error) {
-        console.error('Error loading movies:', error);
-        return [];
-    }
+    return {
+        terms: words.map(text => ({ text, pattern: wordPattern([text]) })),
+        phrase: allWords.length > 1 ? wordPattern(allWords) : null,
+        text: allWords.join(' '),
+    };
 }
 
-function parseGenres(genresStr: string): string[] {
-    try {
-        const cleaned = genresStr.replace(/[\[\]']/g, '');
-        return cleaned.split(',').map(g => g.trim()).filter(g => g.length > 0);
-    } catch {
-        return [];
-    }
-}
-
-// Count non-overlapping occurrences of a literal substring (no regex, so user input is safe)
-function countOccurrences(haystack: string, needle: string): number {
-    return haystack.split(needle).length - 1;
-}
-
-// Returns 0 when no search term matches, so non-matching movies can be dropped
-function calculateRelevanceScore(movie: Movie, searchTerms: string[]): number {
+// Returns 0 when no search term matches, so non-matching titles can be dropped
+function calculateRelevanceScore(indexed: IndexedTitle, search: SearchQuery): number {
+    const title = indexed.item;
     let score = 0;
-    const title = movie.title.toLowerCase();
-    const description = movie.description.toLowerCase();
-    const genres = movie.genres.toLowerCase();
-    const stars = movie.stars.toLowerCase();
-    const directors = movie.directors.toLowerCase();
+    let matchedTerms = 0;
 
-    for (const term of searchTerms) {
-        const lowerTerm = term.toLowerCase();
+    for (const { text, pattern } of search.terms) {
+        // Each word counts for the best field it matches, plus a little for every
+        // other field, so a word repeated in the description can't outweigh a
+        // match on the director or cast
+        const fieldScores: number[] = [];
 
-        // Title match (highest weight)
-        if (title.includes(lowerTerm)) {
-            score += 30;
-            if (title.startsWith(lowerTerm)) score += 10;
+        if (countMatches(indexed.searchTitle, pattern) > 0) {
+            fieldScores.push(title.title.toLowerCase().startsWith(text) ? 40 : 30);
         }
 
-        // Description match (high weight)
-        if (description.includes(lowerTerm)) {
-            score += 15;
-            score += Math.min(countOccurrences(description, lowerTerm) * 2, 10);
+        // Directors, cast and studios weigh the same, so popularity decides between
+        // e.g. Christopher Nolan's films and those starring Lloyd Nolan
+        if (countMatches(indexed.searchPeople, pattern) > 0) fieldScores.push(30);
+
+        if (countMatches(indexed.searchGenres, pattern) > 0) fieldScores.push(20);
+
+        const descriptionMatches = countMatches(title.description, pattern);
+        if (descriptionMatches > 0) {
+            fieldScores.push(10 + Math.min(descriptionMatches * 2, 6));
         }
 
-        // Genre match
-        if (genres.includes(lowerTerm)) {
-            score += 20;
-        }
-
-        // Stars match
-        if (stars.includes(lowerTerm)) {
-            score += 10;
-        }
-
-        // Directors match
-        if (directors.includes(lowerTerm)) {
-            score += 8;
+        if (fieldScores.length > 0) {
+            matchedTerms++;
+            score += Math.max(...fieldScores) + (fieldScores.length - 1) * 5;
         }
     }
 
-    // Only boost movies that actually matched the query
+    // Only boost titles that actually matched the query
     if (score === 0) return 0;
 
-    // Boost by rating
-    const rating = parseFloat(movie.rating);
-    if (!isNaN(rating)) {
-        score += rating * 2;
+    // The full query as a phrase ("tom hanks", "the godfather") beats scattered words
+    if (search.phrase) {
+        if (countMatches(indexed.searchTitle, search.phrase) > 0) score += 50;
+        if (countMatches(indexed.searchPeople, search.phrase) > 0) score += 50;
     }
 
-    // Boost by vote count (popularity)
-    const voteNum = parseVotes(movie.votes);
-    score += Math.min(voteNum / 10000, 5);
+    // Exact title ("Up", "Heat") beats titles that merely contain the words
+    if (title.title.toLowerCase() === search.text || title.altTitle?.toLowerCase() === search.text) {
+        score += 40;
+    }
+
+    // Titles matching only some of the words rank below ones matching all of them
+    score *= matchedTerms / search.terms.length;
+
+    // Boost by rating
+    if (title.rating !== null) {
+        score += title.rating * 2;
+    }
+
+    // Boost by popularity on a log scale (1K votes -> 9, 1M votes -> 18)
+    score += Math.log10(title.votes + 1) * 3;
 
     return score;
 }
 
-// Get all unique genres from movies
-function extractAllGenres(movies: Movie[]): string[] {
-    const genreSet = new Set<string>();
-    for (const movie of movies) {
-        const genres = parseGenres(movie.genres);
-        genres.forEach(g => genreSet.add(g));
-    }
-    return Array.from(genreSet).sort();
+// Rating pulled toward an average of 6.5 when there are few votes, so a title
+// rated 10 by three people doesn't top "Top Rated"
+function weightedRating(title: Title): number {
+    if (title.rating === null) return 0;
+    const minVotes = 1000;
+    return (title.votes * title.rating + minVotes * 6.5) / (title.votes + minVotes);
 }
 
-// Get all available years
-function extractAllYears(movies: Movie[]): string[] {
-    const yearSet = new Set<string>();
-    for (const movie of movies) {
-        if (movie.year) yearSet.add(movie.year);
-    }
-    return Array.from(yearSet).sort((a, b) => parseInt(b) - parseInt(a));
+function extractAllGenres(titles: Title[]): string[] {
+    return [...new Set(titles.flatMap(t => t.genres))].sort();
+}
+
+function extractAllYears(titles: Title[]): string[] {
+    return [...new Set(titles.map(t => t.year).filter(Boolean))].sort((a, b) => parseInt(b) - parseInt(a));
+}
+
+function countByType(titles: Title[]): Record<TitleType, number> {
+    const counts: Record<TitleType, number> = { movie: 0, series: 0, anime: 0 };
+    for (const t of titles) counts[t.type]++;
+    return counts;
 }
 
 export async function GET(request: NextRequest) {
     const searchParams = request.nextUrl.searchParams;
     const query = searchParams.get('query') || '';
-    const limit = parseInt(searchParams.get('limit') || '20');
+    const requestedLimit = parseInt(searchParams.get('limit') || '20', 10);
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, MAX_LIMIT) : 20;
+    const type = searchParams.get('type') || '';
     const genre = searchParams.get('genre') || '';
-    const minRating = parseFloat(searchParams.get('minRating') || '0');
-    const maxRating = parseFloat(searchParams.get('maxRating') || '10');
+    const minRating = parseFloat(searchParams.get('minRating') || '0') || 0;
+    const maxRating = parseFloat(searchParams.get('maxRating') || '10') || 10;
     const year = searchParams.get('year') || '';
     const yearFrom = searchParams.get('yearFrom') || '';
     const yearTo = searchParams.get('yearTo') || '';
@@ -238,145 +147,92 @@ export async function GET(request: NextRequest) {
     const getFiltersOnly = searchParams.get('getFilters') === 'true';
 
     try {
-        const movies = await loadMovies();
+        const catalog = loadCatalog();
+        const titles = catalog.map(indexed => indexed.item);
 
         // If only requesting filter options
         if (getFiltersOnly) {
             return NextResponse.json({
-                genres: extractAllGenres(movies),
-                years: extractAllYears(movies),
-                totalMovies: movies.length,
+                genres: extractAllGenres(titles),
+                years: extractAllYears(titles),
+                totalMovies: titles.length,
+                typeCounts: countByType(titles),
                 mpaRatings: ['G', 'PG', 'PG-13', 'R', 'NC-17', 'Not Rated'],
             });
         }
 
-        // Filter movies
-        let filteredMovies = movies.filter(movie => {
+        let filtered = catalog.filter(({ item: title }) => {
+            if (TITLE_TYPES.includes(type as TitleType) && title.type !== type) return false;
+
             // Genre filter (exact match, so "Drama" doesn't also match "Docudrama")
             if (genre) {
                 const wanted = genre.toLowerCase();
-                if (!parseGenres(movie.genres).some(g => g.toLowerCase() === wanted)) {
-                    return false;
-                }
+                if (!title.genres.some(g => g.toLowerCase() === wanted)) return false;
             }
 
-            // Single year filter
-            if (year) {
-                if (movie.year !== year) {
-                    return false;
-                }
-            }
+            if (year && title.year !== year) return false;
 
-            // Year range filter
             if (yearFrom || yearTo) {
-                const movieYear = parseInt(movie.year);
-                if (yearFrom && movieYear < parseInt(yearFrom)) return false;
-                if (yearTo && movieYear > parseInt(yearTo)) return false;
+                const titleYear = parseInt(title.year);
+                if (yearFrom && titleYear < parseInt(yearFrom)) return false;
+                if (yearTo && titleYear > parseInt(yearTo)) return false;
             }
 
-            // Rating filter
-            const movieRating = parseFloat(movie.rating);
-            if (!isNaN(movieRating)) {
-                if (movieRating < minRating) return false;
-                if (maxRating < 10 && movieRating > maxRating) return false;
+            if (title.rating !== null) {
+                if (title.rating < minRating) return false;
+                if (maxRating < 10 && title.rating > maxRating) return false;
             } else if (minRating > 0) {
-                return false; // Exclude unrated movies if min rating is set
+                return false; // Exclude unrated titles if min rating is set
             }
 
-            // Language filter
             if (language) {
-                const movieLangs = movie.languages.toLowerCase();
-                if (!movieLangs.includes(language.toLowerCase())) {
-                    return false;
-                }
+                const wanted = language.toLowerCase();
+                if (!title.languages.some(l => l.toLowerCase().includes(wanted))) return false;
             }
 
-            // MPA rating filter
-            if (mpa) {
-                if (movie.mpa !== mpa) {
-                    return false;
-                }
-            }
+            if (mpa && title.mpa !== mpa) return false;
 
             return true;
         });
 
         // If there's a query, score by relevance
         if (query) {
-            const allTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
-            const longTerms = allTerms.filter(t => t.length > 2);
-            // Fall back to short words when the query has nothing longer (e.g. "up")
-            const searchTerms = longTerms.length > 0 ? longTerms : allTerms;
-
-            const scoredMovies = filteredMovies.map(movie => ({
-                movie,
-                score: calculateRelevanceScore(movie, searchTerms),
-            }));
-
-            // Filter out zero scores
-            filteredMovies = scoredMovies
-                .filter(item => item.score > 0)
+            const search = buildSearchQuery(query);
+            filtered = filtered
+                .map(indexed => ({ indexed, score: calculateRelevanceScore(indexed, search) }))
+                .filter(result => result.score > 0)
                 .sort((a, b) => b.score - a.score)
-                .map(item => item.movie);
+                .map(result => result.indexed);
         }
 
-        // Apply sorting
+        const results = filtered.map(indexed => indexed.item);
+        const byRating = (a: Title, b: Title) => weightedRating(b) - weightedRating(a);
         switch (sortBy) {
             case 'rating':
-                filteredMovies.sort((a, b) => {
-                    const ratingA = parseFloat(a.rating) || 0;
-                    const ratingB = parseFloat(b.rating) || 0;
-                    return ratingB - ratingA;
-                });
+                results.sort(byRating);
                 break;
             case 'votes':
-                filteredMovies.sort((a, b) => {
-                    const votesA = parseVotes(a.votes);
-                    const votesB = parseVotes(b.votes);
-                    return votesB - votesA;
-                });
+                results.sort((a, b) => b.votes - a.votes);
                 break;
             case 'year':
-                filteredMovies.sort((a, b) => {
-                    const yearA = parseInt(a.year) || 0;
-                    const yearB = parseInt(b.year) || 0;
-                    return yearB - yearA;
-                });
+                results.sort((a, b) => (parseInt(b.year) || 0) - (parseInt(a.year) || 0));
                 break;
             case 'gross':
-                filteredMovies.sort((a, b) => {
-                    const grossA = parseGross(a.grossWorldwide);
-                    const grossB = parseGross(b.grossWorldwide);
-                    return grossB - grossA;
-                });
+                results.sort((a, b) => b.grossWorldwide - a.grossWorldwide);
                 break;
             case 'relevance':
             default:
-                // Already sorted by relevance if query exists
-                if (!query) {
-                    // Default to rating if no query
-                    filteredMovies.sort((a, b) => {
-                        const ratingA = parseFloat(a.rating) || 0;
-                        const ratingB = parseFloat(b.rating) || 0;
-                        return ratingB - ratingA;
-                    });
-                }
+                // Already sorted by relevance if there's a query; otherwise best rated first
+                if (!query) results.sort(byRating);
                 break;
         }
 
-        // Limit results
-        const results = filteredMovies.slice(0, limit).map(movie => ({
-            ...movie,
-            genres: parseGenres(movie.genres),
-            votesNum: parseVotes(movie.votes),
-            grossNum: parseGross(movie.grossWorldwide),
-        }));
-
         return NextResponse.json({
-            results,
-            total: filteredMovies.length,
+            results: results.slice(0, limit),
+            total: results.length,
             query,
             filters: {
+                type,
                 genre,
                 year,
                 yearFrom,
@@ -388,7 +244,6 @@ export async function GET(request: NextRequest) {
                 mpa,
             },
         });
-
     } catch (error) {
         console.error('Search error:', error);
         return NextResponse.json({ error: 'Failed to search movies' }, { status: 500 });

@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# half-written catalogs from an interrupted `npm run update-data`
+/Data/**/*.tmp
