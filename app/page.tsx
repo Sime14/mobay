@@ -1,28 +1,16 @@
 'use client';
 
-import { useState, useEffect, FormEvent } from 'react';
+import { useState, useEffect, useRef, FormEvent } from 'react';
+import dynamic from 'next/dynamic';
+import Image from 'next/image';
+import type { Title, TitleType } from '@/lib/types';
+import TiltCard from './components/TiltCard';
 
-interface Movie {
-  title: string;
-  year: string;
-  duration: string;
-  mpa: string;
-  rating: string;
-  votes: string;
-  votesNum: number;
-  description: string;
-  movieLink: string;
-  directors: string;
-  stars: string;
-  genres: string[];
-  languages: string;
-  releaseDate: string;
-  grossWorldwide: string;
-  grossNum: number;
-}
+// three.js only runs in the browser, and the page shouldn't wait for it to load
+const Backdrop = dynamic(() => import('./components/Backdrop'), { ssr: false });
 
 interface SearchResponse {
-  results: Movie[];
+  results: Title[];
   total: number;
   query: string;
 }
@@ -31,18 +19,27 @@ interface FiltersResponse {
   genres: string[];
   years: string[];
   totalMovies: number;
+  typeCounts?: Record<TitleType, number>;
   mpaRatings: string[];
 }
 
-// Parse array-like strings from CSV
-function parseArrayString(str: string): string[] {
-  try {
-    const cleaned = str.replace(/[\[\]']/g, '');
-    return cleaned.split(',').map(s => s.trim()).filter(s => s.length > 0).slice(0, 3);
-  } catch {
-    return [];
-  }
+interface SearchState {
+  query: string;
+  type: '' | TitleType;
+  genre: string;
+  year: string;
+  minRating: string;
+  sortBy: string;
 }
+
+const EMPTY_SEARCH: SearchState = { query: '', type: '', genre: '', year: '', minRating: '0', sortBy: 'relevance' };
+
+const TYPE_TABS: { value: '' | TitleType; label: string; icon: string }[] = [
+  { value: '', label: 'All', icon: '✨' },
+  { value: 'movie', label: 'Movies', icon: '🎬' },
+  { value: 'series', label: 'Series', icon: '📺' },
+  { value: 'anime', label: 'Anime', icon: '🌸' },
+];
 
 // Format large numbers (e.g. 3000000 -> "3.0M")
 function formatNumber(num: number): string {
@@ -59,7 +56,7 @@ function formatCurrency(num: number): string {
 
 export default function Home() {
   const [query, setQuery] = useState('');
-  const [movies, setMovies] = useState<Movie[]>([]);
+  const [movies, setMovies] = useState<Title[]>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [error, setError] = useState('');
@@ -67,6 +64,7 @@ export default function Home() {
 
   // Filter states
   const [showFilters, setShowFilters] = useState(false);
+  const [type, setType] = useState<'' | TitleType>('');
   const [genre, setGenre] = useState('');
   const [year, setYear] = useState('');
   const [minRating, setMinRating] = useState('0');
@@ -75,29 +73,23 @@ export default function Home() {
   // Theme state
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
 
+  // Bumped after each search so the 3D backdrop can react
+  const [pulse, setPulse] = useState(0);
+  // Only the latest search may update the results, even if an older one finishes later
+  const latestRequest = useRef(0);
+
   // Available filter options
   const [availableGenres, setAvailableGenres] = useState<string[]>([]);
   const [availableYears, setAvailableYears] = useState<string[]>([]);
   const [totalMoviesCount, setTotalMoviesCount] = useState(0);
+  const [typeCounts, setTypeCounts] = useState<Record<TitleType, number>>({ movie: 0, series: 0, anime: 0 });
 
   // Initialize theme from localStorage
   useEffect(() => {
     const savedTheme = localStorage.getItem('theme') as 'light' | 'dark' | null;
-    if (savedTheme) {
-      setTheme(savedTheme);
-      if (savedTheme === 'dark') {
-        document.documentElement.classList.add('dark');
-      } else {
-        document.documentElement.classList.remove('dark');
-      }
-    } else {
-      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-      const initialTheme = prefersDark ? 'dark' : 'light';
-      setTheme(initialTheme);
-      if (prefersDark) {
-        document.documentElement.classList.add('dark');
-      }
-    }
+    const initialTheme = savedTheme ?? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    setTheme(initialTheme);
+    document.documentElement.classList.toggle('dark', initialTheme === 'dark');
   }, []);
 
   // Toggle theme
@@ -105,12 +97,7 @@ export default function Home() {
     const newTheme = theme === 'light' ? 'dark' : 'light';
     setTheme(newTheme);
     localStorage.setItem('theme', newTheme);
-
-    if (newTheme === 'dark') {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
+    document.documentElement.classList.toggle('dark', newTheme === 'dark');
   };
 
   // Load filter options on mount
@@ -122,6 +109,7 @@ export default function Home() {
         setAvailableGenres(data.genres || []);
         setAvailableYears(data.years || []);
         setTotalMoviesCount(data.totalMovies || 0);
+        if (data.typeCounts) setTypeCounts(data.typeCounts);
       } catch (err) {
         console.error('Failed to load filters:', err);
       }
@@ -129,110 +117,101 @@ export default function Home() {
     loadFilters();
   }, []);
 
-  const buildSearchUrl = () => {
+  // Runs a search with the current filters, replacing any given in `overrides`.
+  // Taking overrides (rather than reading state set just before) avoids searching
+  // with stale values, since state updates only apply on the next render.
+  const runSearch = async (overrides: Partial<SearchState> = {}) => {
+    const next: SearchState = { query, type, genre, year, minRating, sortBy, ...overrides };
+    setQuery(next.query);
+    setType(next.type);
+    setGenre(next.genre);
+    setYear(next.year);
+    setMinRating(next.minRating);
+    setSortBy(next.sortBy);
+
     const params = new URLSearchParams();
-    if (query) params.set('query', query);
-    if (genre) params.set('genre', genre);
-    if (year) params.set('year', year);
-    if (minRating !== '0') params.set('minRating', minRating);
-    if (sortBy !== 'relevance') params.set('sortBy', sortBy);
+    if (next.query.trim()) params.set('query', next.query.trim());
+    if (next.type) params.set('type', next.type);
+    if (next.genre) params.set('genre', next.genre);
+    if (next.year) params.set('year', next.year);
+    if (next.minRating !== '0') params.set('minRating', next.minRating);
+    if (next.sortBy !== 'relevance') params.set('sortBy', next.sortBy);
     params.set('limit', '24');
-    return `/api/recommend?${params.toString()}`;
-  };
 
-  const handleSearch = async (e?: FormEvent) => {
-    if (e) e.preventDefault();
-
-    if (!query.trim() && !genre && !year && minRating === '0') {
-      setError('Please enter a search term or select a filter');
-      return;
-    }
-
+    const requestId = ++latestRequest.current;
     setLoading(true);
     setError('');
     setSearched(true);
 
     try {
-      const response = await fetch(buildSearchUrl());
-      const data: SearchResponse = await response.json();
-
+      const response = await fetch(`/api/recommend?${params.toString()}`);
       if (!response.ok) {
         throw new Error('Failed to fetch recommendations');
       }
-
+      const data: SearchResponse = await response.json();
+      if (requestId !== latestRequest.current) return;
       setMovies(data.results);
       setTotal(data.total);
+      setPulse(p => p + 1);
     } catch (err) {
+      if (requestId !== latestRequest.current) return;
       setError(err instanceof Error ? err.message : 'Something went wrong');
       setMovies([]);
     } finally {
-      setLoading(false);
+      if (requestId === latestRequest.current) setLoading(false);
     }
   };
 
-  const handleQuickFilter = async (filterType: string, value?: string) => {
-    setSearched(true);
-    setLoading(true);
-    setError('');
+  const handleSearch = (e?: FormEvent) => {
+    if (e) e.preventDefault();
 
-    // Reset other filters when using quick filter
-    setQuery('');
-    setGenre('');
-    setYear('');
-    setMinRating('0');
+    if (!query.trim() && !type && !genre && !year && minRating === '0') {
+      setError('Please enter a search term or select a filter');
+      return;
+    }
+    runSearch();
+  };
 
-    let url = '/api/recommend?limit=24';
-
+  // Quick filters start a fresh search, but stay within the selected tab
+  const handleQuickFilter = (filterType: string, value = '') => {
+    const fresh = { ...EMPTY_SEARCH, type };
     switch (filterType) {
       case 'topRated':
-        url += '&sortBy=rating&minRating=7';
-        setSortBy('rating');
-        setMinRating('7');
-        break;
+        return runSearch({ ...fresh, sortBy: 'rating', minRating: '7' });
       case 'mostPopular':
-        url += '&sortBy=votes';
-        setSortBy('votes');
-        break;
+        return runSearch({ ...fresh, sortBy: 'votes' });
       case 'boxOffice':
-        url += '&sortBy=gross';
-        setSortBy('gross');
-        break;
+        return runSearch({ ...fresh, sortBy: 'gross' });
+      // Without a query, relevance already lists the best rated first, and it
+      // keeps ranking by relevance if a search term is added afterwards
       case 'year':
-        url += `&year=${value}&sortBy=rating`;
-        setYear(value || '');
-        setSortBy('rating');
-        break;
+        return runSearch({ ...fresh, year: value });
       case 'genre':
-        url += `&genre=${encodeURIComponent(value || '')}&sortBy=rating`;
-        setGenre(value || '');
-        setSortBy('rating');
-        break;
+        return runSearch({ ...fresh, genre: value });
     }
+  };
 
-    try {
-      const response = await fetch(url);
-      const data: SearchResponse = await response.json();
-      setMovies(data.results);
-      setTotal(data.total);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Something went wrong');
-      setMovies([]);
-    } finally {
-      setLoading(false);
-    }
+  // Switching tabs re-runs the current search; before any search it shows the best of that type
+  const handleTypeChange = (newType: '' | TitleType) => {
+    if (searched) runSearch({ type: newType });
+    else runSearch({ ...EMPTY_SEARCH, type: newType });
   };
 
   const clearFilters = () => {
+    latestRequest.current++;
+    setType('');
     setGenre('');
     setYear('');
     setMinRating('0');
     setSortBy('relevance');
     setQuery('');
     setSearched(false);
+    setLoading(false);
     setMovies([]);
   };
 
   const activeFiltersCount = [genre, year, minRating !== '0', sortBy !== 'relevance'].filter(Boolean).length;
+  const typeLabel = TYPE_TABS.find(t => t.value === type)?.label ?? 'All';
 
   const exampleQueries = [
     "mind-bending sci-fi thriller",
@@ -242,10 +221,13 @@ export default function Home() {
   ];
 
   const popularGenres = ['Action', 'Comedy', 'Drama', 'Horror', 'Sci-Fi', 'Romance', 'Thriller', 'Animation'];
-  const recentYears = ['2024', '2023', '2022', '2021', '2020'];
+  // availableYears is sorted newest first
+  const recentYears = availableYears.length > 0 ? availableYears.slice(0, 5) : ['2025', '2024', '2023', '2022', '2021'];
+  const yearSpan = availableYears.length > 0 ? `${availableYears[availableYears.length - 1]}–${availableYears[0]}` : '';
 
   return (
     <div className="page-container">
+      <Backdrop theme={theme} pulse={pulse} />
       <div className="relative z-10">
         {/* Header */}
         <header className="pt-12 pb-8 px-4 sm:px-6 lg:px-8">
@@ -272,8 +254,8 @@ export default function Home() {
               <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold mb-4 tracking-tight">
                 <span className="text-gradient">Mobay</span>
               </h1>
-              <p className="text-lg text-muted max-w-xl mx-auto">
-                Discover your next favorite movie from {totalMoviesCount.toLocaleString()}+ films
+              <p className="text-lg text-muted max-w-xl mx-auto legible">
+                Discover your next favorite movie, series or anime from {totalMoviesCount.toLocaleString()}+ titles
               </p>
             </div>
           </div>
@@ -282,6 +264,28 @@ export default function Home() {
         {/* Quick Filters Bar */}
         <section className="px-4 sm:px-6 lg:px-8 pb-6">
           <div className="max-w-7xl mx-auto">
+            {/* Type Tabs */}
+            <div className="flex justify-center mb-5">
+              <div className="type-tabs" role="tablist" aria-label="Type of title">
+                {/* Hide tabs with nothing in them, e.g. Series before `npm run update-data` has run */}
+                {TYPE_TABS.filter(tab => !tab.value || totalMoviesCount === 0 || typeCounts[tab.value] > 0).map(tab => {
+                  const count = tab.value ? typeCounts[tab.value] : totalMoviesCount;
+                  return (
+                    <button
+                      key={tab.label}
+                      role="tab"
+                      aria-selected={type === tab.value}
+                      onClick={() => handleTypeChange(tab.value)}
+                      className={`type-tab ${type === tab.value ? 'active' : ''}`}
+                    >
+                      <span className="type-tab-icon" aria-hidden="true">{tab.icon}</span> {tab.label}
+                      {count > 0 && <span className="type-tab-count hidden sm:inline">{formatNumber(count)}</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
             <div className="flex flex-wrap items-center justify-center gap-3 mb-5">
               <button onClick={() => handleQuickFilter('topRated')} className="quick-filter gold">
                 ⭐ Top Rated
@@ -296,7 +300,7 @@ export default function Home() {
 
             {/* Year Quick Filters */}
             <div className="flex flex-wrap items-center justify-center gap-2">
-              <span className="text-muted text-sm mr-1">Browse by year:</span>
+              <span className="text-muted text-sm mr-1 legible">Browse by year:</span>
               {recentYears.map(y => (
                 <button
                   key={y}
@@ -347,14 +351,16 @@ export default function Home() {
                     </span>
                   )}
                 </button>
-                <button type="submit" disabled={loading} className="btn-primary whitespace-nowrap">
+                {/* Not disabled while loading: a disabled button also blocks submitting with Enter,
+                    and a new search safely replaces one that's still running */}
+                <button type="submit" className="btn-primary whitespace-nowrap">
                   {loading ? (
                     <span className="flex items-center gap-2">
                       <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>
                       Searching...
                     </span>
                   ) : (
-                    'Find Movies'
+                    'Search'
                   )}
                 </button>
               </div>
@@ -462,7 +468,7 @@ export default function Home() {
             {/* Example Queries */}
             {!searched && (
               <div className="mt-5">
-                <p className="text-sm text-muted mb-3">Try searching for:</p>
+                <p className="text-sm text-muted mb-3 legible">Try searching for:</p>
                 <div className="flex flex-wrap gap-2">
                   {exampleQueries.map((example, index) => (
                     <button
@@ -503,17 +509,20 @@ export default function Home() {
             {!loading && searched && movies.length > 0 && (
               <>
                 <div className="flex items-center justify-between mb-6">
-                  <h2 className="text-xl font-semibold text-main">
-                    {query ? `Results for "${query}"` : 'Movies'}
+                  <h2 className="text-xl font-semibold text-main legible">
+                    {query ? `Results for "${query}"` : type ? typeLabel : 'Movies, series & anime'}
                   </h2>
-                  <span className="text-muted text-sm">
+                  <span className="text-muted text-sm legible">
                     Showing {movies.length} of {total.toLocaleString()}
                   </span>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5 stagger-children">
-                  {movies.map((movie, index) => (
-                    <MovieCard key={`${movie.title}-${index}`} movie={movie} />
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5 stagger-children">
+                  {movies.map(movie => (
+                    // The wrapper runs the fade-in, so its transform doesn't fight the card's tilt
+                    <div key={movie.id}>
+                      <TitleCard title={movie} />
+                    </div>
                   ))}
                 </div>
               </>
@@ -523,7 +532,7 @@ export default function Home() {
             {!loading && searched && movies.length === 0 && !error && (
               <div className="text-center py-20">
                 <div className="text-5xl mb-4">🎬</div>
-                <h3 className="text-xl font-semibold text-main mb-2">No movies found</h3>
+                <h3 className="text-xl font-semibold text-main mb-2">Nothing found</h3>
                 <p className="text-muted mb-4">Try adjusting your filters or search terms</p>
                 <button onClick={clearFilters} className="text-primary hover:underline">
                   Clear all filters
@@ -539,7 +548,7 @@ export default function Home() {
                   Ready to discover great movies?
                 </h3>
                 <p className="text-muted max-w-md mx-auto">
-                  Search by description, filter by genre or year, or use the quick filters above!
+                  Search by title, person or plot, pick Movies, Series or Anime, or use the quick filters above!
                 </p>
               </div>
             )}
@@ -554,8 +563,8 @@ export default function Home() {
               <div className="md:col-span-2">
                 <h3 className="text-2xl font-bold text-gradient mb-3">Mobay</h3>
                 <p className="text-muted text-sm mb-4 max-w-md">
-                  Your ultimate movie discovery companion. Find your next favorite film from our collection
-                  of {totalMoviesCount.toLocaleString()}+ movies spanning over a century of cinema.
+                  Your ultimate movie discovery companion. Find your next favorite film, series or anime from our
+                  collection of {totalMoviesCount.toLocaleString()}+ titles spanning over a century of screen stories.
                 </p>
                 <div className="flex items-center gap-4">
                   <a href="#" className="text-muted hover:text-primary transition-colors" aria-label="Twitter">
@@ -583,7 +592,7 @@ export default function Home() {
                   <li><button onClick={() => handleQuickFilter('topRated')} className="text-muted hover:text-primary transition-colors">Top Rated Movies</button></li>
                   <li><button onClick={() => handleQuickFilter('mostPopular')} className="text-muted hover:text-primary transition-colors">Most Popular</button></li>
                   <li><button onClick={() => handleQuickFilter('boxOffice')} className="text-muted hover:text-primary transition-colors">Box Office Hits</button></li>
-                  <li><button onClick={() => handleQuickFilter('year', '2024')} className="text-muted hover:text-primary transition-colors">New Releases</button></li>
+                  <li><button onClick={() => handleQuickFilter('year', recentYears[0])} className="text-muted hover:text-primary transition-colors">New Releases</button></li>
                 </ul>
               </div>
 
@@ -605,11 +614,15 @@ export default function Home() {
                 © {new Date().getFullYear()} Mobay. All rights reserved.
               </p>
               <div className="flex items-center gap-6 text-sm text-muted">
-                <span>🎬 {totalMoviesCount.toLocaleString()}+ Movies</span>
-                <span>📅 1920-2025</span>
-                <span>⭐ IMDb Data</span>
+                <span>🎬 {totalMoviesCount.toLocaleString()}+ Titles</span>
+                {yearSpan && <span>📅 {yearSpan}</span>}
+                <span>⭐ IMDb · TMDB · AniList</span>
               </div>
             </div>
+            <p className="mt-6 text-xs text-muted">
+              Movie data from IMDb and TMDB, anime data from AniList. This product uses the TMDB API but is not
+              endorsed or certified by TMDB.
+            </p>
           </div>
         </footer>
       </div>
@@ -617,96 +630,171 @@ export default function Home() {
   );
 }
 
-function MovieCard({ movie }: { movie: Movie }) {
-  const directors = parseArrayString(movie.directors);
-  const stars = parseArrayString(movie.stars);
-  const genres = Array.isArray(movie.genres) ? movie.genres : parseArrayString(movie.genres as unknown as string);
+// Where the "View on ..." link goes, for its label
+function linkSource(link: string): string {
+  if (link.includes('imdb.com')) return 'IMDb';
+  if (link.includes('anilist.co')) return 'AniList';
+  if (link.includes('themoviedb.org')) return 'TMDB';
+  return 'details';
+}
+
+const TYPE_BADGES: Record<TitleType, { label: string; className: string }> = {
+  movie: { label: 'Movie', className: 'type-badge movie' },
+  series: { label: 'Series', className: 'type-badge series' },
+  anime: { label: 'Anime', className: 'type-badge anime' },
+};
+
+// Same colours for the same title every time
+function placeholderHue(text: string): number {
+  let hash = 0;
+  for (const char of text) hash = (hash * 31 + char.charCodeAt(0)) % 360;
+  return hash;
+}
+
+function Poster({ title }: { title: Title }) {
+  const [failed, setFailed] = useState(false);
+
+  if (title.poster && !failed) {
+    return (
+      <div className="poster">
+        {/* Posters come straight from TMDB/AniList's image CDNs, so skip Next's optimizer */}
+        <Image
+          src={title.poster}
+          alt={`${title.title} poster`}
+          fill
+          sizes="112px"
+          className="object-cover"
+          unoptimized
+          onError={() => setFailed(true)}
+        />
+      </div>
+    );
+  }
+  const hue = placeholderHue(title.title);
+  // "The Godfather" -> "G"
+  const initial = title.title.replace(/^(the|a|an)\s+/i, '').charAt(0);
+  return (
+    <div
+      className="poster poster-placeholder"
+      style={{ background: `linear-gradient(145deg, hsl(${hue} 70% 55%), hsl(${(hue + 60) % 360} 70% 35%))` }}
+      aria-hidden="true"
+    >
+      <span>{initial}</span>
+    </div>
+  );
+}
+
+function TitleCard({ title }: { title: Title }) {
+  const badge = TYPE_BADGES[title.type];
+  const creditLabel = title.type === 'series' ? 'Created by' : 'Directed by';
+  const directors = title.directors.slice(0, 3);
+  const stars = title.stars.slice(0, 3);
+  const studios = (title.studios ?? []).slice(0, 2);
+  // AniList counts members who added the anime to a list, not votes
+  const votesLabel = title.id.startsWith('anilist-') ? 'fans' : 'votes';
+  const episodeInfo = [
+    title.seasons ? `${title.seasons} season${title.seasons === 1 ? '' : 's'}` : '',
+    title.episodes ? `${title.episodes} episode${title.episodes === 1 ? '' : 's'}` : '',
+    title.status ?? '',
+  ].filter(Boolean);
 
   return (
-    <a
-      href={movie.movieLink || '#'}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="card p-4 block group"
-    >
-      {/* Header */}
-      <div className="flex items-start justify-between gap-2 mb-2">
-        <h3 className="font-semibold text-main group-hover:text-primary transition-colors line-clamp-2 flex-1 text-sm">
-          {movie.title}
-        </h3>
-        {movie.rating && (
-          <span className="rating-badge flex-shrink-0">
-            ⭐ {movie.rating}
-          </span>
-        )}
-      </div>
+    <TiltCard href={title.link} className="card flex h-full group">
+      <Poster title={title} />
 
-      {/* Meta Info */}
-      <div className="flex items-center gap-2 text-xs text-muted mb-3 flex-wrap">
-        <span>{movie.year}</span>
-        {movie.duration && (
-          <>
-            <span className="w-1 h-1 rounded-full bg-border"></span>
-            <span>{movie.duration}</span>
-          </>
-        )}
-        {movie.mpa && (
-          <span className="px-1.5 py-0.5 bg-border rounded text-xs">{movie.mpa}</span>
-        )}
-        {movie.votesNum > 0 && (
-          <>
-            <span className="w-1 h-1 rounded-full bg-border"></span>
-            <span>{formatNumber(movie.votesNum)} votes</span>
-          </>
-        )}
-      </div>
-
-      {/* Genres */}
-      {genres.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 mb-3">
-          {genres.slice(0, 3).map((genre, idx) => (
-            <span key={idx} className="genre-tag">
-              {genre}
+      <div className="p-4 flex-1 min-w-0 flex flex-col">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-2 mb-2">
+          <h3 className="font-semibold text-main group-hover:text-primary transition-colors line-clamp-2 flex-1 text-sm">
+            {title.title}
+          </h3>
+          {title.rating !== null && (
+            <span className="rating-badge flex-shrink-0">
+              ⭐ {title.rating.toFixed(1)}
             </span>
-          ))}
+          )}
         </div>
-      )}
 
-      {/* Description */}
-      <p className="text-sm text-muted line-clamp-2 mb-3">
-        {movie.description}
-      </p>
-
-      {/* Directors & Stars */}
-      <div className="space-y-1 text-xs text-muted">
-        {directors.length > 0 && (
-          <p className="truncate">
-            <span className="opacity-70">Directed by</span> {directors.join(', ')}
-          </p>
-        )}
-        {stars.length > 0 && (
-          <p className="truncate">
-            <span className="opacity-70">Starring</span> {stars.join(', ')}
-          </p>
-        )}
-      </div>
-
-      {/* Box Office */}
-      {movie.grossNum > 0 && (
-        <div className="mt-3 pt-3 border-t border-border text-xs text-green-600 dark:text-green-400 font-medium">
-          💰 {formatCurrency(movie.grossNum)} worldwide
+        {/* Meta Info */}
+        <div className="flex items-center gap-2 text-xs text-muted mb-2 flex-wrap">
+          <span className={badge.className}>
+            {badge.label}{title.format && title.format !== 'Movie' ? ` · ${title.format}` : ''}
+          </span>
+          <span>{title.year}</span>
+          {title.duration && (
+            <>
+              <span className="w-1 h-1 rounded-full bg-border"></span>
+              <span>{title.duration}</span>
+            </>
+          )}
+          {title.mpa && (
+            <span className="px-1.5 py-0.5 bg-border rounded text-xs">{title.mpa}</span>
+          )}
+          {title.votes > 0 && (
+            <>
+              <span className="w-1 h-1 rounded-full bg-border"></span>
+              <span>{formatNumber(title.votes)} {votesLabel}</span>
+            </>
+          )}
         </div>
-      )}
 
-      {/* View Link */}
-      <div className="mt-3 pt-3 border-t border-border">
-        <span className="text-sm text-primary group-hover:underline flex items-center gap-1">
-          View Details
-          <svg className="w-4 h-4 group-hover:translate-x-1 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
-          </svg>
-        </span>
+        {/* Seasons, episodes and status for series and anime */}
+        {episodeInfo.length > 0 && (
+          <p className="text-xs text-muted mb-2">{episodeInfo.join(' · ')}</p>
+        )}
+
+        {/* Genres */}
+        {title.genres.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mb-3">
+            {title.genres.slice(0, 3).map(genre => (
+              <span key={genre} className="genre-tag">
+                {genre}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Description */}
+        <p className="text-sm text-muted line-clamp-3 mb-3">
+          {title.description}
+        </p>
+
+        {/* Credits */}
+        <div className="space-y-1 text-xs text-muted mt-auto">
+          {directors.length > 0 && (
+            <p className="truncate">
+              <span className="opacity-70">{creditLabel}</span> {directors.join(', ')}
+            </p>
+          )}
+          {stars.length > 0 && (
+            <p className="truncate">
+              <span className="opacity-70">Starring</span> {stars.join(', ')}
+            </p>
+          )}
+          {studios.length > 0 && (
+            <p className="truncate">
+              <span className="opacity-70">{title.type === 'series' ? 'On' : 'Studio'}</span> {studios.join(', ')}
+            </p>
+          )}
+        </div>
+
+        {/* Box Office */}
+        {title.grossWorldwide > 0 && (
+          <div className="mt-3 pt-3 border-t border-border text-xs text-green-600 dark:text-green-400 font-medium">
+            💰 {formatCurrency(title.grossWorldwide)} worldwide
+          </div>
+        )}
+
+        {/* View Link */}
+        <div className="mt-3 pt-3 border-t border-border">
+          <span className="text-sm text-primary group-hover:underline flex items-center gap-1">
+            View on {linkSource(title.link)}
+            <svg className="w-4 h-4 group-hover:translate-x-1 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
+            </svg>
+          </span>
+        </div>
       </div>
-    </a>
+    </TiltCard>
   );
 }

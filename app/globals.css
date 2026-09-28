@@ -1,5 +1,8 @@
 @import "tailwindcss";
 
+/* Make `dark:` utilities follow the theme toggle (the .dark class) instead of the OS setting */
+@custom-variant dark (&:where(.dark, .dark *));
+
 /* Light Mode (Default) */
 :root {
   --background: #F8FAFC;
@@ -60,25 +63,25 @@ body {
 }
 
 /* Subtle gradient overlay for dark mode */
-@media (prefers-color-scheme: dark) {
-  .page-container::before {
-    content: '';
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background:
-      radial-gradient(ellipse at 20% 0%, rgba(99, 102, 241, 0.08) 0%, transparent 50%),
-      radial-gradient(ellipse at 80% 100%, rgba(251, 191, 36, 0.05) 0%, transparent 50%);
-    pointer-events: none;
-    z-index: 0;
-  }
+html.dark .page-container::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background:
+    radial-gradient(ellipse at 20% 0%, rgba(99, 102, 241, 0.08) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 100%, rgba(251, 191, 36, 0.05) 0%, transparent 50%);
+  pointer-events: none;
+  z-index: 0;
 }
 
-/* Card/Surface styling */
+/* Card/Surface styling: slightly see-through so the 3D backdrop shows behind */
 .card {
-  background-color: var(--surface);
+  background-color: color-mix(in srgb, var(--surface) 86%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--border);
   border-radius: 12px;
   transition: all 0.2s ease;
@@ -89,10 +92,8 @@ body {
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
 }
 
-@media (prefers-color-scheme: dark) {
-  .card:hover {
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-  }
+html.dark .card:hover {
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
 }
 
 /* Search input styling */
@@ -147,7 +148,7 @@ body {
 
 /* Secondary/outline button */
 .btn-secondary {
-  background-color: transparent;
+  background-color: var(--surface);
   color: var(--text-main);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -161,7 +162,7 @@ body {
 .btn-secondary:hover {
   border-color: var(--primary);
   color: var(--primary);
-  background-color: rgba(99, 102, 241, 0.05);
+  background-color: color-mix(in srgb, var(--primary) 6%, var(--surface));
 }
 
 /* Rating badge (Star ratings, Oscar badges) */
@@ -188,10 +189,8 @@ body {
   border: 1px solid rgba(99, 102, 241, 0.2);
 }
 
-@media (prefers-color-scheme: dark) {
-  .genre-tag {
-    background-color: rgba(99, 102, 241, 0.15);
-  }
+html.dark .genre-tag {
+  background-color: rgba(99, 102, 241, 0.15);
 }
 
 /* Quick filter pills */
@@ -243,10 +242,8 @@ body {
   border-color: rgba(251, 191, 36, 0.5);
 }
 
-@media (prefers-color-scheme: dark) {
-  .quick-filter.gold {
-    color: var(--secondary);
-  }
+html.dark .quick-filter.gold {
+  color: var(--secondary);
 }
 
 .quick-filter.pink {
@@ -260,10 +257,8 @@ body {
   border-color: rgba(236, 72, 153, 0.4);
 }
 
-@media (prefers-color-scheme: dark) {
-  .quick-filter.pink {
-    color: #F472B6;
-  }
+html.dark .quick-filter.pink {
+  color: #F472B6;
 }
 
 .quick-filter.green {
@@ -277,10 +272,8 @@ body {
   border-color: rgba(34, 197, 94, 0.4);
 }
 
-@media (prefers-color-scheme: dark) {
-  .quick-filter.green {
-    color: #34D399;
-  }
+html.dark .quick-filter.green {
+  color: #34D399;
 }
 
 /* Text utilities */
@@ -503,4 +496,193 @@ input[type="range"]::-moz-range-thumb {
   border-radius: 50%;
   cursor: pointer;
   border: none;
+}
+/* ---------------------------------------------------------------- 3D backdrop */
+
+.backdrop-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 0;
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------- Tilt cards */
+
+.tilt-card {
+  position: relative;
+  overflow: hidden;
+  transform: perspective(900px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg));
+  transition: transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1), border-color 0.2s ease, box-shadow 0.2s ease;
+  will-change: transform;
+}
+
+/* Follow the pointer closely while hovering; ease back when it leaves */
+.tilt-card.is-tilting {
+  transition: transform 0.08s linear, border-color 0.2s ease, box-shadow 0.2s ease;
+  box-shadow: 0 18px 40px -12px rgba(79, 70, 229, 0.35);
+}
+
+.tilt-glare {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(circle at var(--glare-x, 50%) var(--glare-y, 50%), rgba(255, 255, 255, 0.22), transparent 55%);
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+
+.tilt-card.is-tilting .tilt-glare {
+  opacity: 1;
+}
+
+/* A soft halo in the page colour keeps text readable over the moving backdrop */
+.legible {
+  text-shadow: 0 0 12px var(--background), 0 0 6px var(--background), 0 0 2px var(--background);
+}
+
+/* ---------------------------------------------------------------- Posters */
+
+.poster {
+  position: relative;
+  flex-shrink: 0;
+  width: 112px;
+  align-self: stretch;
+  min-height: 168px;
+  overflow: hidden;
+  border-radius: 11px 0 0 11px;
+  background-color: var(--border);
+}
+
+.poster-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.poster-placeholder span {
+  font-family: var(--font-display), system-ui, sans-serif;
+  font-size: 2.75rem;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.85);
+  text-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+@media (max-width: 400px) {
+  .poster {
+    width: 88px;
+    min-height: 132px;
+  }
+}
+
+/* ---------------------------------------------------------------- Type tabs and badges */
+
+.type-tabs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.25rem;
+  padding: 0.3rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background-color: color-mix(in srgb, var(--surface) 80%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.type-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.5rem 1rem;
+  border-radius: 999px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.type-tab:hover {
+  color: var(--primary);
+}
+
+.type-tab.active {
+  color: white;
+  background: linear-gradient(135deg, var(--primary) 0%, #A855F7 100%);
+  box-shadow: 0 6px 18px -6px rgba(99, 102, 241, 0.6);
+}
+
+.type-tab-count {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background-color: rgba(148, 163, 184, 0.2);
+}
+
+.type-tab.active .type-tab-count {
+  background-color: rgba(255, 255, 255, 0.25);
+}
+
+/* Fit all four tabs on one row on phones */
+@media (max-width: 480px) {
+  .type-tab {
+    padding: 0.45rem 0.7rem;
+    font-size: 0.85rem;
+  }
+
+  .type-tab-icon {
+    display: none;
+  }
+}
+
+.type-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.45rem;
+  border-radius: 6px;
+}
+
+.type-badge.movie {
+  color: #4338CA;
+  background-color: rgba(99, 102, 241, 0.12);
+}
+
+.type-badge.series {
+  color: #0E7490;
+  background-color: rgba(6, 182, 212, 0.14);
+}
+
+.type-badge.anime {
+  color: #BE185D;
+  background-color: rgba(236, 72, 153, 0.14);
+}
+
+html.dark .type-badge.movie {
+  color: #A5B4FC;
+}
+
+html.dark .type-badge.series {
+  color: #67E8F9;
+}
+
+html.dark .type-badge.anime {
+  color: #F9A8D4;
+}
+
+/* ---------------------------------------------------------------- Reduced motion */
+
+@media (prefers-reduced-motion: reduce) {
+  .tilt-card,
+  .tilt-card.is-tilting {
+    transform: none;
+  }
+
+  .stagger-children > *,
+  .animate-fade-in {
+    animation: none;
+    opacity: 1;
+  }
 }
