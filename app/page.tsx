@@ -1,13 +1,8 @@
 'use client';
 
-import { useState, useEffect, useRef, FormEvent } from 'react';
-import dynamic from 'next/dynamic';
+import { useState, useEffect, useRef, type FormEvent } from 'react';
 import Image from 'next/image';
 import type { Title, TitleType } from '@/lib/types';
-import TiltCard from './components/TiltCard';
-
-// three.js only runs in the browser, and the page shouldn't wait for it to load
-const Backdrop = dynamic(() => import('./components/Backdrop'), { ssr: false });
 
 interface SearchResponse {
   results: Title[];
@@ -30,16 +25,39 @@ interface SearchState {
   year: string;
   minRating: string;
   sortBy: string;
+  limit: number;
 }
 
-const EMPTY_SEARCH: SearchState = { query: '', type: '', genre: '', year: '', minRating: '0', sortBy: 'relevance' };
+const PAGE_SIZE = 24;
+// The API returns at most 100 results per request
+const MAX_RESULTS = 96;
 
-const TYPE_TABS: { value: '' | TitleType; label: string; icon: string }[] = [
-  { value: '', label: 'All', icon: '✨' },
-  { value: 'movie', label: 'Movies', icon: '🎬' },
-  { value: 'series', label: 'Series', icon: '📺' },
-  { value: 'anime', label: 'Anime', icon: '🌸' },
+const EMPTY_SEARCH: SearchState = {
+  query: '',
+  type: '',
+  genre: '',
+  year: '',
+  minRating: '0',
+  sortBy: 'relevance',
+  limit: PAGE_SIZE,
+};
+
+const TYPE_TABS: { value: '' | TitleType; label: string }[] = [
+  { value: '', label: 'All' },
+  { value: 'movie', label: 'Movies' },
+  { value: 'series', label: 'Series' },
+  { value: 'anime', label: 'Anime' },
 ];
+
+const SORT_OPTIONS = [
+  { value: 'relevance', label: 'Top picks' },
+  { value: 'rating', label: 'Top rated' },
+  { value: 'votes', label: 'Most popular' },
+  { value: 'year', label: 'Newest' },
+  { value: 'gross', label: 'Box office' },
+];
+
+const POPULAR_GENRES = ['Action', 'Comedy', 'Drama', 'Horror', 'Sci-Fi', 'Romance', 'Thriller', 'Animation'];
 
 // Format large numbers (e.g. 3000000 -> "3.0M")
 function formatNumber(num: number): string {
@@ -49,79 +67,58 @@ function formatNumber(num: number): string {
   return num.toString();
 }
 
-// Format money amounts (e.g. 1447038421 -> "$1.4B")
-function formatCurrency(num: number): string {
-  return `$${formatNumber(num)}`;
+// A heading for the results, e.g. "Top rated · Horror · Movies"
+function describeSearch(search: SearchState): string {
+  const query = search.query.trim();
+  if (query) return `Results for “${query}”`;
+  const parts = [SORT_OPTIONS.find(o => o.value === search.sortBy)?.label ?? 'Top picks'];
+  if (search.genre) parts.push(search.genre);
+  if (search.year) parts.push(search.year);
+  if (search.type) parts.push(TYPE_TABS.find(t => t.value === search.type)!.label);
+  return parts.join(' · ');
+}
+
+// Whether `search` is exactly what a quick link would run, so the link can show as selected
+function matchesQuickLink(search: SearchState, overrides: Partial<SearchState>): boolean {
+  const expected = { ...EMPTY_SEARCH, ...overrides };
+  return (['query', 'genre', 'year', 'minRating', 'sortBy'] as const).every(key => search[key] === expected[key]);
 }
 
 export default function Home() {
+  // Filters as currently set in the search box and filter panel
   const [query, setQuery] = useState('');
-  const [movies, setMovies] = useState<Title[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [searched, setSearched] = useState(false);
-  const [error, setError] = useState('');
-  const [total, setTotal] = useState(0);
-
-  // Filter states
-  const [showFilters, setShowFilters] = useState(false);
   const [type, setType] = useState<'' | TitleType>('');
   const [genre, setGenre] = useState('');
   const [year, setYear] = useState('');
   const [minRating, setMinRating] = useState('0');
   const [sortBy, setSortBy] = useState('relevance');
+  // The search whose results are on screen
+  const [shown, setShown] = useState<SearchState>(EMPTY_SEARCH);
 
-  // Theme state
+  const [titles, setTitles] = useState<Title[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState('');
+  // Bumped on each new search (not "Show more") so the grid fades in again
+  const [resultsKey, setResultsKey] = useState(0);
+  const [showFilters, setShowFilters] = useState(false);
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
-
-  // Bumped after each search so the 3D backdrop can react
-  const [pulse, setPulse] = useState(0);
   // Only the latest search may update the results, even if an older one finishes later
   const latestRequest = useRef(0);
 
   // Available filter options
   const [availableGenres, setAvailableGenres] = useState<string[]>([]);
   const [availableYears, setAvailableYears] = useState<string[]>([]);
-  const [totalMoviesCount, setTotalMoviesCount] = useState(0);
+  const [totalTitles, setTotalTitles] = useState(0);
   const [typeCounts, setTypeCounts] = useState<Record<TitleType, number>>({ movie: 0, series: 0, anime: 0 });
-
-  // Initialize theme from localStorage
-  useEffect(() => {
-    const savedTheme = localStorage.getItem('theme') as 'light' | 'dark' | null;
-    const initialTheme = savedTheme ?? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-    setTheme(initialTheme);
-    document.documentElement.classList.toggle('dark', initialTheme === 'dark');
-  }, []);
-
-  // Toggle theme
-  const toggleTheme = () => {
-    const newTheme = theme === 'light' ? 'dark' : 'light';
-    setTheme(newTheme);
-    localStorage.setItem('theme', newTheme);
-    document.documentElement.classList.toggle('dark', newTheme === 'dark');
-  };
-
-  // Load filter options on mount
-  useEffect(() => {
-    async function loadFilters() {
-      try {
-        const response = await fetch('/api/recommend?getFilters=true');
-        const data: FiltersResponse = await response.json();
-        setAvailableGenres(data.genres || []);
-        setAvailableYears(data.years || []);
-        setTotalMoviesCount(data.totalMovies || 0);
-        if (data.typeCounts) setTypeCounts(data.typeCounts);
-      } catch (err) {
-        console.error('Failed to load filters:', err);
-      }
-    }
-    loadFilters();
-  }, []);
 
   // Runs a search with the current filters, replacing any given in `overrides`.
   // Taking overrides (rather than reading state set just before) avoids searching
   // with stale values, since state updates only apply on the next render.
-  const runSearch = async (overrides: Partial<SearchState> = {}) => {
-    const next: SearchState = { query, type, genre, year, minRating, sortBy, ...overrides };
+  // `append` keeps the current results on screen while more are loading.
+  const runSearch = async (overrides: Partial<SearchState> = {}, append = false) => {
+    const next: SearchState = { query, type, genre, year, minRating, sortBy, limit: PAGE_SIZE, ...overrides };
     setQuery(next.query);
     setType(next.type);
     setGenre(next.genre);
@@ -136,665 +133,413 @@ export default function Home() {
     if (next.year) params.set('year', next.year);
     if (next.minRating !== '0') params.set('minRating', next.minRating);
     if (next.sortBy !== 'relevance') params.set('sortBy', next.sortBy);
-    params.set('limit', '24');
+    params.set('limit', String(next.limit));
 
     const requestId = ++latestRequest.current;
-    setLoading(true);
     setError('');
-    setSearched(true);
+    if (append) setLoadingMore(true);
+    else setLoading(true);
 
     try {
       const response = await fetch(`/api/recommend?${params.toString()}`);
-      if (!response.ok) {
-        throw new Error('Failed to fetch recommendations');
-      }
+      if (!response.ok) throw new Error('Failed to load titles');
       const data: SearchResponse = await response.json();
       if (requestId !== latestRequest.current) return;
-      setMovies(data.results);
+      setTitles(data.results);
       setTotal(data.total);
-      setPulse(p => p + 1);
+      setShown(next);
+      if (!append) setResultsKey(k => k + 1);
     } catch (err) {
       if (requestId !== latestRequest.current) return;
       setError(err instanceof Error ? err.message : 'Something went wrong');
-      setMovies([]);
+      setTitles([]);
+      setTotal(0);
     } finally {
-      if (requestId === latestRequest.current) setLoading(false);
+      if (requestId === latestRequest.current) {
+        setLoading(false);
+        setLoadingMore(false);
+      }
     }
   };
 
-  const handleSearch = (e?: FormEvent) => {
-    if (e) e.preventDefault();
+  // Load filter options and the opening list of top picks
+  useEffect(() => {
+    setTheme(document.documentElement.classList.contains('dark') ? 'dark' : 'light');
 
-    if (!query.trim() && !type && !genre && !year && minRating === '0') {
-      setError('Please enter a search term or select a filter');
-      return;
+    async function loadFilters() {
+      try {
+        const response = await fetch('/api/recommend?getFilters=true');
+        const data: FiltersResponse = await response.json();
+        setAvailableGenres(data.genres || []);
+        setAvailableYears(data.years || []);
+        setTotalTitles(data.totalMovies || 0);
+        if (data.typeCounts) setTypeCounts(data.typeCounts);
+      } catch (err) {
+        console.error('Failed to load filters:', err);
+      }
     }
+    loadFilters();
+    runSearch(EMPTY_SEARCH);
+    // Runs once on mount; runSearch reads the latest state each time it's called
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const toggleTheme = () => {
+    const newTheme = theme === 'light' ? 'dark' : 'light';
+    setTheme(newTheme);
+    try {
+      localStorage.setItem('theme', newTheme);
+    } catch {
+      // Storage can be blocked; the theme still changes for this visit
+    }
+    document.documentElement.classList.toggle('dark', newTheme === 'dark');
+  };
+
+  const handleSearch = (e: FormEvent) => {
+    e.preventDefault();
     runSearch();
   };
 
-  // Quick filters start a fresh search, but stay within the selected tab
-  const handleQuickFilter = (filterType: string, value = '') => {
-    const fresh = { ...EMPTY_SEARCH, type };
-    switch (filterType) {
-      case 'topRated':
-        return runSearch({ ...fresh, sortBy: 'rating', minRating: '7' });
-      case 'mostPopular':
-        return runSearch({ ...fresh, sortBy: 'votes' });
-      case 'boxOffice':
-        return runSearch({ ...fresh, sortBy: 'gross' });
-      // Without a query, relevance already lists the best rated first, and it
-      // keeps ranking by relevance if a search term is added afterwards
-      case 'year':
-        return runSearch({ ...fresh, year: value });
-      case 'genre':
-        return runSearch({ ...fresh, genre: value });
-    }
+  // Quick links start a fresh search, but stay within the selected tab
+  const runQuickLink = (overrides: Partial<SearchState>) => {
+    runSearch({ ...EMPTY_SEARCH, type: shown.type, ...overrides });
   };
 
-  // Switching tabs re-runs the current search; before any search it shows the best of that type
+  // Switching tabs re-runs the search on screen for the new type
   const handleTypeChange = (newType: '' | TitleType) => {
-    if (searched) runSearch({ type: newType });
-    else runSearch({ ...EMPTY_SEARCH, type: newType });
+    runSearch({ ...shown, type: newType, limit: PAGE_SIZE });
   };
 
-  const clearFilters = () => {
-    latestRequest.current++;
-    setType('');
-    setGenre('');
-    setYear('');
-    setMinRating('0');
-    setSortBy('relevance');
-    setQuery('');
-    setSearched(false);
-    setLoading(false);
-    setMovies([]);
+  const showMore = () => {
+    runSearch({ ...shown, limit: shown.limit + PAGE_SIZE }, true);
   };
 
-  const activeFiltersCount = [genre, year, minRating !== '0', sortBy !== 'relevance'].filter(Boolean).length;
-  const typeLabel = TYPE_TABS.find(t => t.value === type)?.label ?? 'All';
+  const goHome = () => {
+    setShowFilters(false);
+    runSearch(EMPTY_SEARCH);
+  };
 
-  const exampleQueries = [
-    "mind-bending sci-fi thriller",
-    "heartwarming family adventure",
-    "intense action great villain",
-    "romantic comedy",
+  const activeFiltersCount = [shown.genre, shown.year, shown.minRating !== '0', shown.sortBy !== 'relevance'].filter(Boolean).length;
+
+  // availableYears is sorted newest first
+  const latestYear = availableYears[0] ?? '';
+  const yearSpan = availableYears.length > 0 ? `${availableYears[availableYears.length - 1]}–${latestYear}` : '';
+
+  const quickLinks: { label: string; search: Partial<SearchState> }[] = [
+    { label: 'Top rated', search: { sortBy: 'rating', minRating: '7' } },
+    { label: 'Most popular', search: { sortBy: 'votes' } },
+    { label: 'Box office', search: { sortBy: 'gross' } },
+    ...(latestYear ? [{ label: 'New releases', search: { year: latestYear } }] : []),
   ];
 
-  const popularGenres = ['Action', 'Comedy', 'Drama', 'Horror', 'Sci-Fi', 'Romance', 'Thriller', 'Animation'];
-  // availableYears is sorted newest first
-  const recentYears = availableYears.length > 0 ? availableYears.slice(0, 5) : ['2025', '2024', '2023', '2022', '2021'];
-  const yearSpan = availableYears.length > 0 ? `${availableYears[availableYears.length - 1]}–${availableYears[0]}` : '';
+  // Hide tabs with nothing in them, e.g. Series before `npm run update-data` has run
+  const tabs = TYPE_TABS.filter(tab => !tab.value || totalTitles === 0 || typeCounts[tab.value] > 0);
 
   return (
-    <div className="page-container">
-      <Backdrop theme={theme} pulse={pulse} />
-      <div className="relative z-10">
-        {/* Header */}
-        <header className="pt-12 pb-8 px-4 sm:px-6 lg:px-8">
-          <div className="max-w-7xl mx-auto">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex-1"></div>
+    <div className="min-h-screen flex flex-col">
+      <header className="site-header">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-wrap items-center gap-x-8 gap-y-2">
+          <button type="button" onClick={goHome} className="wordmark">
+            Mobay
+          </button>
+
+          <nav aria-label="Browse" className="order-last w-full md:order-none md:w-auto flex gap-6 overflow-x-auto no-scrollbar">
+            {tabs.map(tab => (
               <button
-                onClick={toggleTheme}
-                className="btn-secondary p-2.5 rounded-lg"
-                aria-label="Toggle theme"
+                key={tab.label}
+                type="button"
+                onClick={() => handleTypeChange(tab.value)}
+                aria-current={shown.type === tab.value ? 'page' : undefined}
+                className={`nav-tab ${shown.type === tab.value ? 'active' : ''}`}
               >
-                {theme === 'dark' ? (
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
-                  </svg>
-                ) : (
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
-                  </svg>
-                )}
+                {tab.label}
               </button>
-            </div>
-            <div className="text-center">
-              <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold mb-4 tracking-tight">
-                <span className="text-gradient">Mobay</span>
-              </h1>
-              <p className="text-lg text-muted max-w-xl mx-auto legible">
-                Discover your next favorite movie, series or anime from {totalMoviesCount.toLocaleString()}+ titles
-              </p>
-            </div>
-          </div>
-        </header>
+            ))}
+          </nav>
 
-        {/* Quick Filters Bar */}
-        <section className="px-4 sm:px-6 lg:px-8 pb-6">
-          <div className="max-w-7xl mx-auto">
-            {/* Type Tabs */}
-            <div className="flex justify-center mb-5">
-              <div className="type-tabs" role="tablist" aria-label="Type of title">
-                {/* Hide tabs with nothing in them, e.g. Series before `npm run update-data` has run */}
-                {TYPE_TABS.filter(tab => !tab.value || totalMoviesCount === 0 || typeCounts[tab.value] > 0).map(tab => {
-                  const count = tab.value ? typeCounts[tab.value] : totalMoviesCount;
-                  return (
-                    <button
-                      key={tab.label}
-                      role="tab"
-                      aria-selected={type === tab.value}
-                      onClick={() => handleTypeChange(tab.value)}
-                      className={`type-tab ${type === tab.value ? 'active' : ''}`}
-                    >
-                      <span className="type-tab-icon" aria-hidden="true">{tab.icon}</span> {tab.label}
-                      {count > 0 && <span className="type-tab-count hidden sm:inline">{formatNumber(count)}</span>}
-                    </button>
-                  );
-                })}
-              </div>
+          <form onSubmit={handleSearch} role="search" className="flex-1 min-w-0 md:max-w-md md:ml-auto">
+            <label htmlFor="search" className="sr-only">
+              Search
+            </label>
+            <div className="relative">
+              <svg
+                className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted pointer-events-none"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+              <input
+                id="search"
+                type="search"
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+                placeholder="Search titles, people or plots"
+                className="search-input"
+                autoComplete="off"
+              />
             </div>
+          </form>
 
-            <div className="flex flex-wrap items-center justify-center gap-3 mb-5">
-              <button onClick={() => handleQuickFilter('topRated')} className="quick-filter gold">
-                ⭐ Top Rated
-              </button>
-              <button onClick={() => handleQuickFilter('mostPopular')} className="quick-filter pink">
-                🔥 Most Popular
-              </button>
-              <button onClick={() => handleQuickFilter('boxOffice')} className="quick-filter green">
-                💰 Box Office Hits
-              </button>
-            </div>
+          <button onClick={toggleTheme} className="icon-button" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
+            {theme === 'dark' ? (
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+              </svg>
+            ) : (
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+              </svg>
+            )}
+          </button>
+        </div>
+      </header>
 
-            {/* Year Quick Filters */}
-            <div className="flex flex-wrap items-center justify-center gap-2">
-              <span className="text-muted text-sm mr-1 legible">Browse by year:</span>
-              {recentYears.map(y => (
+      <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        {/* Quick links and genres */}
+        <div className="flex items-center gap-3 mb-6">
+          <div className="flex-1 min-w-0 flex items-center gap-2 overflow-x-auto no-scrollbar">
+            {quickLinks.map(link => {
+              const active = matchesQuickLink(shown, link.search);
+              return (
                 <button
-                  key={y}
-                  onClick={() => handleQuickFilter('year', y)}
-                  className={`filter-pill ${year === y ? 'active' : ''}`}
+                  key={link.label}
+                  type="button"
+                  onClick={() => runQuickLink(link.search)}
+                  aria-pressed={active}
+                  className={`chip ${active ? 'active' : ''}`}
                 >
-                  {y}
+                  {link.label}
                 </button>
+              );
+            })}
+            <span className="chip-divider" aria-hidden="true" />
+            {POPULAR_GENRES.map(g => {
+              const active = matchesQuickLink(shown, { genre: g });
+              return (
+                <button
+                  key={g}
+                  type="button"
+                  onClick={() => runQuickLink({ genre: g })}
+                  aria-pressed={active}
+                  className={`chip ${active ? 'active' : ''}`}
+                >
+                  {g}
+                </button>
+              );
+            })}
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowFilters(!showFilters)}
+            aria-expanded={showFilters}
+            className={`chip flex-shrink-0 ${showFilters ? 'selected' : ''}`}
+          >
+            Filters{activeFiltersCount > 0 ? ` (${activeFiltersCount})` : ''}
+          </button>
+        </div>
+
+        {showFilters && (
+          <form
+            className="panel mb-8"
+            onSubmit={e => {
+              e.preventDefault();
+              runSearch();
+            }}
+          >
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <label className="field">
+                <span>Genre</span>
+                <select value={genre} onChange={e => setGenre(e.target.value)}>
+                  <option value="">Any genre</option>
+                  {availableGenres.map(g => (
+                    <option key={g} value={g}>
+                      {g}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>Year</span>
+                <select value={year} onChange={e => setYear(e.target.value)}>
+                  <option value="">Any year</option>
+                  {availableYears.map(y => (
+                    <option key={y} value={y}>
+                      {y}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>Rating</span>
+                <select value={minRating} onChange={e => setMinRating(e.target.value)}>
+                  <option value="0">Any rating</option>
+                  {['6', '7', '8', '9'].map(r => (
+                    <option key={r} value={r}>
+                      {r}+
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>Sort by</span>
+                <select value={sortBy} onChange={e => setSortBy(e.target.value)}>
+                  {SORT_OPTIONS.map(o => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="flex justify-end gap-2 mt-5">
+              <button type="button" onClick={() => runSearch({ ...EMPTY_SEARCH, query, type })} className="btn-ghost">
+                Reset
+              </button>
+              <button type="submit" className="btn">
+                Apply
+              </button>
+            </div>
+          </form>
+        )}
+
+        <div className="flex items-baseline justify-between gap-4 mb-5">
+          <h1 className="text-xl sm:text-2xl font-semibold tracking-tight text-main truncate">{describeSearch(shown)}</h1>
+          {!loading && total > 0 && (
+            <span className="text-sm text-muted flex-shrink-0">{total.toLocaleString()} titles</span>
+          )}
+        </div>
+
+        {error ? (
+          <div className="py-24 text-center">
+            <p className="text-main font-medium mb-2">{error}</p>
+            <button type="button" onClick={() => runSearch(shown)} className="btn-ghost">
+              Try again
+            </button>
+          </div>
+        ) : loading ? (
+          <div className="title-grid" aria-busy="true" aria-label="Loading titles">
+            {Array.from({ length: 12 }, (_, i) => (
+              <div key={i}>
+                <div className="skeleton aspect-[2/3]" />
+                <div className="skeleton h-3.5 mt-3 w-4/5" />
+                <div className="skeleton h-3 mt-2 w-1/2" />
+              </div>
+            ))}
+          </div>
+        ) : titles.length === 0 ? (
+          <div className="py-24 text-center">
+            <p className="text-main font-medium mb-1">No titles found</p>
+            <p className="text-muted text-sm mb-5">Try a different search or fewer filters.</p>
+            <button type="button" onClick={goHome} className="btn-ghost">
+              Back to top picks
+            </button>
+          </div>
+        ) : (
+          <>
+            <div key={resultsKey} className="title-grid fade-in">
+              {titles.map(title => (
+                <TitleCard key={title.id} title={title} showType={!shown.type} />
               ))}
             </div>
-          </div>
-        </section>
-
-        {/* Search Section */}
-        <section className="px-4 sm:px-6 lg:px-8 pb-8">
-          <div className="max-w-3xl mx-auto">
-            <form onSubmit={handleSearch} className="relative">
-              <div className="flex flex-col sm:flex-row gap-3">
-                <div className="flex-1 relative">
-                  <input
-                    type="text"
-                    value={query}
-                    onChange={(e) => setQuery(e.target.value)}
-                    placeholder="Describe what you're looking for..."
-                    className="search-input pr-12"
-                  />
-                  <svg
-                    className="absolute right-4 top-1/2 -translate-y-1/2 w-5 h-5 text-muted"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-                  </svg>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setShowFilters(!showFilters)}
-                  className={`btn-secondary flex items-center gap-2 ${showFilters || activeFiltersCount > 0 ? 'border-primary text-primary' : ''}`}
-                >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
-                  </svg>
-                  Filters
-                  {activeFiltersCount > 0 && (
-                    <span className="w-5 h-5 rounded-full bg-primary text-white text-xs flex items-center justify-center">
-                      {activeFiltersCount}
-                    </span>
-                  )}
-                </button>
-                {/* Not disabled while loading: a disabled button also blocks submitting with Enter,
-                    and a new search safely replaces one that's still running */}
-                <button type="submit" className="btn-primary whitespace-nowrap">
-                  {loading ? (
-                    <span className="flex items-center gap-2">
-                      <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>
-                      Searching...
-                    </span>
-                  ) : (
-                    'Search'
-                  )}
-                </button>
-              </div>
-            </form>
-
-            {/* Expandable Filters Panel */}
-            {showFilters && (
-              <div className="mt-4 card p-5 animate-fade-in">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="text-main font-semibold">Advanced Filters</h3>
-                  {activeFiltersCount > 0 && (
-                    <button onClick={clearFilters} className="text-sm text-primary hover:underline">
-                      Clear all
-                    </button>
-                  )}
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                  {/* Genre Filter */}
-                  <div>
-                    <label className="block text-sm text-muted mb-2">Genre</label>
-                    <select
-                      value={genre}
-                      onChange={(e) => setGenre(e.target.value)}
-                      className="w-full bg-surface border border-border rounded-lg px-3 py-2.5 text-main 
-                               focus:outline-none focus:border-primary cursor-pointer"
-                    >
-                      <option value="">All Genres</option>
-                      {availableGenres.map(g => (
-                        <option key={g} value={g}>{g}</option>
-                      ))}
-                    </select>
-                  </div>
-
-                  {/* Year Filter */}
-                  <div>
-                    <label className="block text-sm text-muted mb-2">Year</label>
-                    <select
-                      value={year}
-                      onChange={(e) => setYear(e.target.value)}
-                      className="w-full bg-surface border border-border rounded-lg px-3 py-2.5 text-main 
-                               focus:outline-none focus:border-primary cursor-pointer"
-                    >
-                      <option value="">All Years</option>
-                      {availableYears.map(y => (
-                        <option key={y} value={y}>{y}</option>
-                      ))}
-                    </select>
-                  </div>
-
-                  {/* Min Rating Filter */}
-                  <div>
-                    <label className="block text-sm text-muted mb-2">Min Rating: {minRating}</label>
-                    <input
-                      type="range"
-                      min="0"
-                      max="9"
-                      step="0.5"
-                      value={minRating}
-                      onChange={(e) => setMinRating(e.target.value)}
-                      className="w-full"
-                    />
-                    <div className="flex justify-between text-xs text-muted mt-1">
-                      <span>0</span>
-                      <span>9+</span>
-                    </div>
-                  </div>
-
-                  {/* Sort By */}
-                  <div>
-                    <label className="block text-sm text-muted mb-2">Sort By</label>
-                    <select
-                      value={sortBy}
-                      onChange={(e) => setSortBy(e.target.value)}
-                      className="w-full bg-surface border border-border rounded-lg px-3 py-2.5 text-main 
-                               focus:outline-none focus:border-primary cursor-pointer"
-                    >
-                      <option value="relevance">Relevance</option>
-                      <option value="rating">Highest Rated</option>
-                      <option value="votes">Most Votes</option>
-                      <option value="year">Newest First</option>
-                      <option value="gross">Box Office</option>
-                    </select>
-                  </div>
-                </div>
-
-                {/* Genre Pills */}
-                <div className="mt-5 pt-4 border-t border-border">
-                  <p className="text-sm text-muted mb-3">Popular genres:</p>
-                  <div className="flex flex-wrap gap-2">
-                    {popularGenres.map(g => (
-                      <button
-                        key={g}
-                        onClick={() => setGenre(genre === g ? '' : g)}
-                        className={`filter-pill ${genre === g ? 'active' : ''}`}
-                      >
-                        {g}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Example Queries */}
-            {!searched && (
-              <div className="mt-5">
-                <p className="text-sm text-muted mb-3 legible">Try searching for:</p>
-                <div className="flex flex-wrap gap-2">
-                  {exampleQueries.map((example, index) => (
-                    <button
-                      key={index}
-                      onClick={() => setQuery(example)}
-                      className="filter-pill"
-                    >
-                      {example}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        </section>
-
-        {/* Results Section */}
-        <section className="px-4 sm:px-6 lg:px-8 pb-20">
-          <div className="max-w-7xl mx-auto">
-            {/* Error Message */}
-            {error && (
-              <div className="text-center py-8">
-                <div className="card inline-block px-6 py-4 text-red-500">
-                  <p>{error}</p>
-                </div>
-              </div>
-            )}
-
-            {/* Loading State */}
-            {loading && (
-              <div className="flex flex-col items-center justify-center py-20">
-                <div className="loader mb-4"></div>
-                <p className="text-muted">Finding movies...</p>
-              </div>
-            )}
-
-            {/* Results */}
-            {!loading && searched && movies.length > 0 && (
-              <>
-                <div className="flex items-center justify-between mb-6">
-                  <h2 className="text-xl font-semibold text-main legible">
-                    {query ? `Results for "${query}"` : type ? typeLabel : 'Movies, series & anime'}
-                  </h2>
-                  <span className="text-muted text-sm legible">
-                    Showing {movies.length} of {total.toLocaleString()}
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5 stagger-children">
-                  {movies.map(movie => (
-                    // The wrapper runs the fade-in, so its transform doesn't fight the card's tilt
-                    <div key={movie.id}>
-                      <TitleCard title={movie} />
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-
-            {/* No Results */}
-            {!loading && searched && movies.length === 0 && !error && (
-              <div className="text-center py-20">
-                <div className="text-5xl mb-4">🎬</div>
-                <h3 className="text-xl font-semibold text-main mb-2">Nothing found</h3>
-                <p className="text-muted mb-4">Try adjusting your filters or search terms</p>
-                <button onClick={clearFilters} className="text-primary hover:underline">
-                  Clear all filters
+            {titles.length < total && shown.limit < MAX_RESULTS && (
+              <div className="mt-12 text-center">
+                <button type="button" onClick={showMore} disabled={loadingMore} className="btn-ghost">
+                  {loadingMore ? 'Loading…' : 'Show more'}
                 </button>
               </div>
             )}
+          </>
+        )}
+      </main>
 
-            {/* Initial State */}
-            {!searched && !loading && (
-              <div className="text-center py-20">
-                <div className="text-7xl mb-6 wiggle-on-hover">🍿</div>
-                <h3 className="text-2xl font-semibold text-main mb-3">
-                  Ready to discover great movies?
-                </h3>
-                <p className="text-muted max-w-md mx-auto">
-                  Search by title, person or plot, pick Movies, Series or Anime, or use the quick filters above!
-                </p>
-              </div>
-            )}
-          </div>
-        </section>
-
-        {/* Footer */}
-        <footer className="border-t border-border mt-12">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
-              {/* Brand Section */}
-              <div className="md:col-span-2">
-                <h3 className="text-2xl font-bold text-gradient mb-3">Mobay</h3>
-                <p className="text-muted text-sm mb-4 max-w-md">
-                  Your ultimate movie discovery companion. Find your next favorite film, series or anime from our
-                  collection of {totalMoviesCount.toLocaleString()}+ titles spanning over a century of screen stories.
-                </p>
-                <div className="flex items-center gap-4">
-                  <a href="#" className="text-muted hover:text-primary transition-colors" aria-label="Twitter">
-                    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                      <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
-                    </svg>
-                  </a>
-                  <a href="#" className="text-muted hover:text-primary transition-colors" aria-label="GitHub">
-                    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                      <path fillRule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clipRule="evenodd" />
-                    </svg>
-                  </a>
-                  <a href="#" className="text-muted hover:text-primary transition-colors" aria-label="Instagram">
-                    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                      <path d="M12.315 2c2.43 0 2.784.013 3.808.06 1.064.049 1.791.218 2.427.465a4.902 4.902 0 011.772 1.153 4.902 4.902 0 011.153 1.772c.247.636.416 1.363.465 2.427.048 1.067.06 1.407.06 4.123v.08c0 2.643-.012 2.987-.06 4.043-.049 1.064-.218 1.791-.465 2.427a4.902 4.902 0 01-1.153 1.772 4.902 4.902 0 01-1.772 1.153c-.636.247-1.363.416-2.427.465-1.067.048-1.407.06-4.123.06h-.08c-2.643 0-2.987-.012-4.043-.06-1.064-.049-1.791-.218-2.427-.465a4.902 4.902 0 01-1.772-1.153 4.902 4.902 0 01-1.153-1.772c-.247-.636-.416-1.363-.465-2.427-.047-1.024-.06-1.379-.06-3.808v-.63c0-2.43.013-2.784.06-3.808.049-1.064.218-1.791.465-2.427a4.902 4.902 0 011.153-1.772A4.902 4.902 0 015.45 2.525c.636-.247 1.363-.416 2.427-.465C8.901 2.013 9.256 2 11.685 2h.63zm-.081 1.802h-.468c-2.456 0-2.784.011-3.807.058-.975.045-1.504.207-1.857.344-.467.182-.8.398-1.15.748-.35.35-.566.683-.748 1.15-.137.353-.3.882-.344 1.857-.047 1.023-.058 1.351-.058 3.807v.468c0 2.456.011 2.784.058 3.807.045.975.207 1.504.344 1.857.182.466.399.8.748 1.15.35.35.683.566 1.15.748.353.137.882.3 1.857.344 1.054.048 1.37.058 4.041.058h.08c2.597 0 2.917-.01 3.96-.058.976-.045 1.505-.207 1.858-.344.466-.182.8-.398 1.15-.748.35-.35.566-.683.748-1.15.137-.353.3-.882.344-1.857.048-1.055.058-1.37.058-4.041v-.08c0-2.597-.01-2.917-.058-3.96-.045-.976-.207-1.505-.344-1.858a3.097 3.097 0 00-.748-1.15 3.098 3.098 0 00-1.15-.748c-.353-.137-.882-.3-1.857-.344-1.023-.047-1.351-.058-3.807-.058zM12 6.865a5.135 5.135 0 110 10.27 5.135 5.135 0 010-10.27zm0 1.802a3.333 3.333 0 100 6.666 3.333 3.333 0 000-6.666zm5.338-3.205a1.2 1.2 0 110 2.4 1.2 1.2 0 010-2.4z" />
-                    </svg>
-                  </a>
-                </div>
-              </div>
-
-              {/* Quick Links */}
-              <div>
-                <h4 className="font-semibold text-main mb-4">Explore</h4>
-                <ul className="space-y-2 text-sm">
-                  <li><button onClick={() => handleQuickFilter('topRated')} className="text-muted hover:text-primary transition-colors">Top Rated Movies</button></li>
-                  <li><button onClick={() => handleQuickFilter('mostPopular')} className="text-muted hover:text-primary transition-colors">Most Popular</button></li>
-                  <li><button onClick={() => handleQuickFilter('boxOffice')} className="text-muted hover:text-primary transition-colors">Box Office Hits</button></li>
-                  <li><button onClick={() => handleQuickFilter('year', recentYears[0])} className="text-muted hover:text-primary transition-colors">New Releases</button></li>
-                </ul>
-              </div>
-
-              {/* Genres */}
-              <div>
-                <h4 className="font-semibold text-main mb-4">Popular Genres</h4>
-                <ul className="space-y-2 text-sm">
-                  <li><button onClick={() => handleQuickFilter('genre', 'Action')} className="text-muted hover:text-primary transition-colors">Action</button></li>
-                  <li><button onClick={() => handleQuickFilter('genre', 'Comedy')} className="text-muted hover:text-primary transition-colors">Comedy</button></li>
-                  <li><button onClick={() => handleQuickFilter('genre', 'Drama')} className="text-muted hover:text-primary transition-colors">Drama</button></li>
-                  <li><button onClick={() => handleQuickFilter('genre', 'Horror')} className="text-muted hover:text-primary transition-colors">Horror</button></li>
-                </ul>
-              </div>
-            </div>
-
-            {/* Bottom bar */}
-            <div className="mt-10 pt-8 border-t border-border flex flex-col sm:flex-row items-center justify-between gap-4">
-              <p className="text-muted text-sm">
-                © {new Date().getFullYear()} Mobay. All rights reserved.
+      <footer className="site-footer">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex flex-col sm:flex-row sm:justify-between gap-4 text-sm text-muted">
+          <div>
+            <p className="font-semibold text-main mb-1">Mobay</p>
+            {totalTitles > 0 && (
+              <p>
+                {totalTitles.toLocaleString()} movies, series and anime{yearSpan ? `, ${yearSpan}` : ''}.
               </p>
-              <div className="flex items-center gap-6 text-sm text-muted">
-                <span>🎬 {totalMoviesCount.toLocaleString()}+ Titles</span>
-                {yearSpan && <span>📅 {yearSpan}</span>}
-                <span>⭐ IMDb · TMDB · AniList</span>
-              </div>
-            </div>
-            <p className="mt-6 text-xs text-muted">
-              Movie data from IMDb and TMDB, anime data from AniList. This product uses the TMDB API but is not
-              endorsed or certified by TMDB.
-            </p>
+            )}
           </div>
-        </footer>
-      </div>
+          <p className="sm:max-w-sm sm:text-right">
+            Data from IMDb, TMDB and AniList. This product uses the TMDB API but is not endorsed or certified by TMDB.
+          </p>
+        </div>
+      </footer>
     </div>
   );
 }
 
-// Where the "View on ..." link goes, for its label
-function linkSource(link: string): string {
-  if (link.includes('imdb.com')) return 'IMDb';
-  if (link.includes('anilist.co')) return 'AniList';
-  if (link.includes('themoviedb.org')) return 'TMDB';
-  return 'details';
-}
-
-const TYPE_BADGES: Record<TitleType, { label: string; className: string }> = {
-  movie: { label: 'Movie', className: 'type-badge movie' },
-  series: { label: 'Series', className: 'type-badge series' },
-  anime: { label: 'Anime', className: 'type-badge anime' },
-};
-
-// Same colours for the same title every time
-function placeholderHue(text: string): number {
-  let hash = 0;
-  for (const char of text) hash = (hash * 31 + char.charCodeAt(0)) % 360;
-  return hash;
-}
+const TYPE_LABELS: Record<TitleType, string> = { movie: 'Movie', series: 'Series', anime: 'Anime' };
 
 function Poster({ title }: { title: Title }) {
   const [failed, setFailed] = useState(false);
 
   if (title.poster && !failed) {
     return (
-      <div className="poster">
-        {/* Posters come straight from TMDB/AniList's image CDNs, so skip Next's optimizer */}
-        <Image
-          src={title.poster}
-          alt={`${title.title} poster`}
-          fill
-          sizes="112px"
-          className="object-cover"
-          unoptimized
-          onError={() => setFailed(true)}
-        />
-      </div>
+      // Posters come straight from TMDB/AniList's image CDNs, so skip Next's optimizer
+      <Image
+        src={title.poster}
+        alt=""
+        fill
+        sizes="(min-width: 1280px) 200px, (min-width: 768px) 25vw, 50vw"
+        className="object-cover"
+        unoptimized
+        onError={() => setFailed(true)}
+      />
     );
   }
-  const hue = placeholderHue(title.title);
-  // "The Godfather" -> "G"
-  const initial = title.title.replace(/^(the|a|an)\s+/i, '').charAt(0);
   return (
-    <div
-      className="poster poster-placeholder"
-      style={{ background: `linear-gradient(145deg, hsl(${hue} 70% 55%), hsl(${(hue + 60) % 360} 70% 35%))` }}
-      aria-hidden="true"
-    >
-      <span>{initial}</span>
+    <div className="poster-placeholder" aria-hidden="true">
+      <span className="poster-placeholder-title">{title.title}</span>
+      <span className="poster-placeholder-year">{title.year}</span>
     </div>
   );
 }
 
-function TitleCard({ title }: { title: Title }) {
-  const badge = TYPE_BADGES[title.type];
-  const creditLabel = title.type === 'series' ? 'Created by' : 'Directed by';
-  const directors = title.directors.slice(0, 3);
-  const stars = title.stars.slice(0, 3);
-  const studios = (title.studios ?? []).slice(0, 2);
+function TitleCard({ title, showType }: { title: Title; showType: boolean }) {
+  // Length for movies; seasons, episodes or format for series and anime
+  let detail = '';
+  if (title.type === 'movie') detail = title.duration;
+  else if (title.seasons) detail = `${title.seasons} season${title.seasons === 1 ? '' : 's'}`;
+  else if (title.episodes && title.episodes > 1) detail = `${title.episodes} episodes`;
+  else if (title.format) detail = title.format;
+
+  const meta = [title.year, showType && title.type !== 'movie' ? TYPE_LABELS[title.type] : '', detail].filter(Boolean);
+  const credits = title.directors.length > 0 ? title.directors : (title.studios ?? []);
   // AniList counts members who added the anime to a list, not votes
   const votesLabel = title.id.startsWith('anilist-') ? 'fans' : 'votes';
-  const episodeInfo = [
-    title.seasons ? `${title.seasons} season${title.seasons === 1 ? '' : 's'}` : '',
-    title.episodes ? `${title.episodes} episode${title.episodes === 1 ? '' : 's'}` : '',
-    title.status ?? '',
-  ].filter(Boolean);
 
   return (
-    <TiltCard href={title.link} className="card flex h-full group">
-      <Poster title={title} />
-
-      <div className="p-4 flex-1 min-w-0 flex flex-col">
-        {/* Header */}
-        <div className="flex items-start justify-between gap-2 mb-2">
-          <h3 className="font-semibold text-main group-hover:text-primary transition-colors line-clamp-2 flex-1 text-sm">
-            {title.title}
-          </h3>
-          {title.rating !== null && (
-            <span className="rating-badge flex-shrink-0">
-              ⭐ {title.rating.toFixed(1)}
-            </span>
-          )}
-        </div>
-
-        {/* Meta Info */}
-        <div className="flex items-center gap-2 text-xs text-muted mb-2 flex-wrap">
-          <span className={badge.className}>
-            {badge.label}{title.format && title.format !== 'Movie' ? ` · ${title.format}` : ''}
-          </span>
-          <span>{title.year}</span>
-          {title.duration && (
-            <>
-              <span className="w-1 h-1 rounded-full bg-border"></span>
-              <span>{title.duration}</span>
-            </>
-          )}
-          {title.mpa && (
-            <span className="px-1.5 py-0.5 bg-border rounded text-xs">{title.mpa}</span>
-          )}
-          {title.votes > 0 && (
-            <>
-              <span className="w-1 h-1 rounded-full bg-border"></span>
-              <span>{formatNumber(title.votes)} {votesLabel}</span>
-            </>
-          )}
-        </div>
-
-        {/* Seasons, episodes and status for series and anime */}
-        {episodeInfo.length > 0 && (
-          <p className="text-xs text-muted mb-2">{episodeInfo.join(' · ')}</p>
-        )}
-
-        {/* Genres */}
-        {title.genres.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mb-3">
-            {title.genres.slice(0, 3).map(genre => (
-              <span key={genre} className="genre-tag">
-                {genre}
-              </span>
-            ))}
+    <a href={title.link || undefined} target="_blank" rel="noopener noreferrer" className="title-card">
+      <div className="title-poster">
+        <Poster title={title} />
+        {(title.description || title.genres.length > 0) && (
+          <div className="title-overlay" aria-hidden="true">
+            {title.genres.length > 0 && <p className="overlay-genres">{title.genres.slice(0, 3).join(' · ')}</p>}
+            {title.description && <p className="overlay-description">{title.description}</p>}
+            {credits.length > 0 && <p className="overlay-credits">{credits.slice(0, 2).join(', ')}</p>}
+            {title.votes > 0 && (
+              <p className="overlay-credits">
+                {formatNumber(title.votes)} {votesLabel}
+              </p>
+            )}
           </div>
         )}
-
-        {/* Description */}
-        <p className="text-sm text-muted line-clamp-3 mb-3">
-          {title.description}
-        </p>
-
-        {/* Credits */}
-        <div className="space-y-1 text-xs text-muted mt-auto">
-          {directors.length > 0 && (
-            <p className="truncate">
-              <span className="opacity-70">{creditLabel}</span> {directors.join(', ')}
-            </p>
-          )}
-          {stars.length > 0 && (
-            <p className="truncate">
-              <span className="opacity-70">Starring</span> {stars.join(', ')}
-            </p>
-          )}
-          {studios.length > 0 && (
-            <p className="truncate">
-              <span className="opacity-70">{title.type === 'series' ? 'On' : 'Studio'}</span> {studios.join(', ')}
-            </p>
-          )}
-        </div>
-
-        {/* Box Office */}
-        {title.grossWorldwide > 0 && (
-          <div className="mt-3 pt-3 border-t border-border text-xs text-green-600 dark:text-green-400 font-medium">
-            💰 {formatCurrency(title.grossWorldwide)} worldwide
-          </div>
-        )}
-
-        {/* View Link */}
-        <div className="mt-3 pt-3 border-t border-border">
-          <span className="text-sm text-primary group-hover:underline flex items-center gap-1">
-            View on {linkSource(title.link)}
-            <svg className="w-4 h-4 group-hover:translate-x-1 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
-            </svg>
-          </span>
-        </div>
       </div>
-    </TiltCard>
+      <h3 className="title-name">{title.title}</h3>
+      <p className="title-meta">
+        {title.rating !== null && (
+          <span className="title-rating">
+            <span aria-hidden="true">★</span> {title.rating.toFixed(1)}
+          </span>
+        )}
+        <span className="truncate">{meta.join(' · ')}</span>
+      </p>
+    </a>
   );
 }

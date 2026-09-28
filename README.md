@@ -1,6 +1,6 @@
 # Mobay
 
-Search movies, TV series and anime by title, person, genre or plot. Built with Next.js, with an animated three.js backdrop.
+Search movies, TV series and anime by title, person, genre or plot. Built with Next.js.
 
 ## Getting started
 
